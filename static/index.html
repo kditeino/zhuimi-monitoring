@@ -1,12 +1,27 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta http-equiv="refresh" content="600" />
   <title>追觅客户监控 · Susciyuan</title>
+  <script>
+    (function () {
+      var theme = "dark";
+      try {
+        var saved = localStorage.getItem("zhuimi-theme");
+        if (saved === "light" || saved === "dark") {
+          theme = saved;
+        } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+          theme = "light";
+        }
+      } catch (e) {}
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
   <style>
     :root {
+      color-scheme: dark;
       --bg: #090b0f;
       --bg-elev: #11141a;
       --bg-card: #161a22;
@@ -32,6 +47,77 @@
       --refund: #7db8c9;
       --shadow: 0 8px 24px rgba(0,0,0,.28);
       --radius: 12px;
+      --pill-bd: rgba(142,160,184,.28);
+      --row-active-bd: rgba(142,160,184,.55);
+      --pre-bg: #0b0d12;
+      --pre-fg: #d5dbe6;
+      --banner-err-fg: #f3b4ba;
+      --skel-1: #141821;
+      --skel-2: #1c2230;
+      --badge-recharge-fg: #8ea4d4;
+      --badge-recharge-bd: rgba(142,164,212,.3);
+      --badge-consume-fg: #86d0ac;
+      --badge-consume-bd: rgba(93,174,134,.3);
+      --badge-manage-bg: rgba(185,163,201,.12);
+      --badge-manage-fg: #d2c0de;
+      --badge-manage-bd: rgba(185,163,201,.3);
+      --badge-system-bg: rgba(154,163,178,.12);
+      --badge-system-fg: #c5ccd6;
+      --badge-system-bd: rgba(154,163,178,.28);
+      --badge-error-fg: #f0a0a8;
+      --badge-error-bd: rgba(226,91,106,.35);
+      --badge-refund-bg: rgba(125,184,201,.12);
+      --badge-refund-fg: #9ed0dc;
+      --badge-refund-bd: rgba(125,184,201,.3);
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --bg-elev: #ffffff;
+      --bg-card: #ffffff;
+      --bg-row: #ffffff;
+      --bg-hover: #eef2f7;
+      --bg-active: #e6edf6;
+      --line: #d7dde7;
+      --line-strong: #c2cad6;
+      --text: #1a2030;
+      --text-2: #3d4656;
+      --muted: #667085;
+      --money: #8f7234;
+      --money-dim: rgba(143, 114, 52, .10);
+      --error: #c43d4d;
+      --error-dim: rgba(196, 61, 77, .10);
+      --ok: #2f8a5c;
+      --ok-dim: rgba(47, 138, 92, .10);
+      --steel: #4f6480;
+      --steel-dim: rgba(79, 100, 128, .12);
+      --recharge: #3d5a94;
+      --manage: #6a4d7d;
+      --system: #4a5260;
+      --refund: #2d6473;
+      --shadow: 0 8px 24px rgba(24, 36, 56, .08);
+      --pill-bd: rgba(79,100,128,.28);
+      --row-active-bd: rgba(79,100,128,.42);
+      --pre-bg: #eef1f6;
+      --pre-fg: #1f2533;
+      --banner-err-fg: #9a2433;
+      --skel-1: #e6ebf2;
+      --skel-2: #f4f6f9;
+      --badge-recharge-fg: #3d5a94;
+      --badge-recharge-bd: rgba(61,90,148,.28);
+      --badge-consume-fg: #2a7a54;
+      --badge-consume-bd: rgba(42,122,84,.28);
+      --badge-manage-bg: rgba(122,95,143,.10);
+      --badge-manage-fg: #6a4d7d;
+      --badge-manage-bd: rgba(122,95,143,.28);
+      --badge-system-bg: rgba(92,101,115,.10);
+      --badge-system-fg: #4a5260;
+      --badge-system-bd: rgba(92,101,115,.25);
+      --badge-error-fg: #b02e3d;
+      --badge-error-bd: rgba(196,61,77,.30);
+      --badge-refund-bg: rgba(61,122,138,.10);
+      --badge-refund-fg: #2d6473;
+      --badge-refund-bd: rgba(61,122,138,.28);
     }
     * { box-sizing: border-box; }
     html, body {
@@ -59,6 +145,12 @@
       padding: 14px 14px 12px;
       border-bottom: 1px solid var(--line);
     }
+    .header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+    }
     .eyebrow {
       font-size: 11px;
       letter-spacing: .14em;
@@ -71,6 +163,36 @@
       font-size: 1.28rem;
       font-weight: 650;
       letter-spacing: .01em;
+    }
+    .theme-toggle {
+      display: inline-flex;
+      flex-shrink: 0;
+      border: 1px solid var(--line-strong);
+      background: var(--bg-elev);
+      border-radius: 9px;
+      overflow: hidden;
+    }
+    .theme-toggle button {
+      appearance: none;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 6px 11px;
+      min-height: 34px;
+      min-width: 44px;
+      font-size: 12px;
+      font-weight: 620;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .theme-toggle button + button { border-left: 1px solid var(--line); }
+    .theme-toggle button[aria-pressed="true"] {
+      background: var(--bg-active);
+      color: var(--text);
+    }
+    .theme-toggle button:focus-visible {
+      outline: 2px solid var(--steel);
+      outline-offset: -2px;
     }
     .sub {
       margin-top: 8px;
@@ -85,7 +207,7 @@
       display: inline-flex; align-items: center;
       background: var(--steel-dim);
       color: var(--steel);
-      border: 1px solid rgba(142,160,184,.28);
+      border: 1px solid var(--pill-bd);
       border-radius: 999px;
       padding: 2px 8px;
       font-size: 11px;
@@ -176,7 +298,7 @@
     .row:hover { background: var(--bg-hover); border-color: var(--line-strong); }
     .row.active {
       background: var(--bg-active);
-      border-color: rgba(142,160,184,.55);
+      border-color: var(--row-active-bd);
       box-shadow: inset 3px 0 0 var(--steel);
     }
     .row-top {
@@ -189,12 +311,12 @@
       border-radius: 999px; padding: 2px 8px;
       border: 1px solid transparent;
     }
-    .t-充值 { background: var(--steel-dim); color: var(--recharge); border-color: rgba(142,164,212,.3); }
-    .t-消费 { background: var(--ok-dim); color: #86d0ac; border-color: rgba(93,174,134,.3); }
-    .t-管理 { background: rgba(185,163,201,.12); color: #d2c0de; border-color: rgba(185,163,201,.3); }
-    .t-系统 { background: rgba(154,163,178,.12); color: #c5ccd6; border-color: rgba(154,163,178,.28); }
-    .t-错误 { background: var(--error-dim); color: #f0a0a8; border-color: rgba(226,91,106,.35); }
-    .t-退款 { background: rgba(125,184,201,.12); color: #9ed0dc; border-color: rgba(125,184,201,.3); }
+    .t-充值 { background: var(--steel-dim); color: var(--badge-recharge-fg); border-color: var(--badge-recharge-bd); }
+    .t-消费 { background: var(--ok-dim); color: var(--badge-consume-fg); border-color: var(--badge-consume-bd); }
+    .t-管理 { background: var(--badge-manage-bg); color: var(--badge-manage-fg); border-color: var(--badge-manage-bd); }
+    .t-系统 { background: var(--badge-system-bg); color: var(--badge-system-fg); border-color: var(--badge-system-bd); }
+    .t-错误 { background: var(--error-dim); color: var(--badge-error-fg); border-color: var(--badge-error-bd); }
+    .t-退款 { background: var(--badge-refund-bg); color: var(--badge-refund-fg); border-color: var(--badge-refund-bd); }
     .meta {
       display: flex; flex-wrap: wrap; gap: 6px 10px;
       font-size: 13px; color: var(--text);
@@ -232,13 +354,13 @@
     pre.full {
       margin: 12px 0 0;
       padding: 10px 12px;
-      background: #0b0d12;
+      background: var(--pre-bg);
       border-radius: 10px;
       border: 1px solid var(--line);
       white-space: pre-wrap;
       word-break: break-word;
       font-size: 12px;
-      color: #d5dbe6;
+      color: var(--pre-fg);
       max-height: 240px;
       overflow: auto;
     }
@@ -250,8 +372,8 @@
     }
     .banner.err {
       background: var(--error-dim);
-      color: #f3b4ba;
-      border: 1px solid rgba(226,91,106,.35);
+      color: var(--banner-err-fg);
+      border: 1px solid var(--badge-error-bd);
     }
     .banner.empty {
       background: var(--bg-card);
@@ -272,7 +394,7 @@
     .skel i {
       display: block; height: 78px;
       border-radius: 12px;
-      background: linear-gradient(90deg, #141821, #1c2230, #141821);
+      background: linear-gradient(90deg, var(--skel-1), var(--skel-2), var(--skel-1));
       background-size: 200% 100%;
       animation: shine 1.2s ease-in-out infinite;
     }
@@ -286,8 +408,16 @@
 <body>
   <div class="wrap">
     <header class="top">
-      <div class="eyebrow">Susciyuan · Internal</div>
-      <h1>追觅客户监控</h1>
+      <div class="header-row">
+        <div>
+          <div class="eyebrow">Susciyuan · Internal</div>
+          <h1>追觅客户监控</h1>
+        </div>
+        <div class="theme-toggle" role="group" aria-label="主题">
+          <button type="button" id="themeLight" aria-pressed="false">浅色</button>
+          <button type="button" id="themeDark" aria-pressed="true">深色</button>
+        </div>
+      </div>
       <div class="sub">
         <span class="pill" id="scopePill">全站</span>
         <span id="windowText">近 3 天</span>
@@ -325,6 +455,36 @@
       "充值": "t-充值", "消费": "t-消费", "管理": "t-管理",
       "系统": "t-系统", "错误": "t-错误", "退款": "t-退款"
     };
+    const THEME_KEY = "zhuimi-theme";
+
+    function resolveTheme() {
+      try {
+        const saved = localStorage.getItem(THEME_KEY);
+        if (saved === "light" || saved === "dark") return saved;
+      } catch (e) {}
+      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+        return "light";
+      }
+      return "dark";
+    }
+
+    function applyTheme(theme) {
+      const t = theme === "light" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", t);
+      const lightBtn = document.getElementById("themeLight");
+      const darkBtn = document.getElementById("themeDark");
+      if (lightBtn) lightBtn.setAttribute("aria-pressed", t === "light" ? "true" : "false");
+      if (darkBtn) darkBtn.setAttribute("aria-pressed", t === "dark" ? "true" : "false");
+    }
+
+    function setTheme(theme) {
+      applyTheme(theme);
+      try { localStorage.setItem(THEME_KEY, theme === "light" ? "light" : "dark"); } catch (e) {}
+    }
+
+    applyTheme(resolveTheme());
+    document.getElementById("themeLight").addEventListener("click", function () { setTheme("light"); });
+    document.getElementById("themeDark").addEventListener("click", function () { setTheme("dark"); });
 
     function esc(s) {
       return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
