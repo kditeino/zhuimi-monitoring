@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta http-equiv="refresh" content="600" />
+  <title>追觅客户监控 · Susciyuan</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --card: #141e30;
+      --card2: #1a2740;
+      --line: rgba(255,255,255,.08);
+      --text: #e8eef9;
+      --muted: #93a0b8;
+      --accent: #5b8cff;
+      --good: #3ecf8e;
+      --warn: #f5a524;
+      --bad: #ff6b7a;
+      --recharge: #7c9cff;
+      --consume: #3ecf8e;
+      --manage: #c084fc;
+      --system: #94a3b8;
+      --error: #ff6b7a;
+      --refund: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      font-size: 15px;
+      line-height: 1.45;
+    }
+    body { min-height: 100vh; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 14px 12px 28px; }
+    header {
+      display: flex; flex-direction: column; gap: 6px;
+      margin-bottom: 14px;
+    }
+    header h1 {
+      margin: 0; font-size: 1.25rem; font-weight: 700; letter-spacing: .02em;
+    }
+    .sub {
+      color: var(--muted); font-size: .82rem;
+      display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
+    }
+    .pill {
+      display: inline-flex; align-items: center; gap: 4px;
+      background: rgba(91,140,255,.15); color: #b7cbff;
+      border: 1px solid rgba(91,140,255,.28);
+      border-radius: 999px; padding: 2px 8px; font-size: .75rem;
+    }
+    .btn {
+      appearance: none; border: 1px solid var(--line);
+      background: var(--card2); color: var(--text);
+      border-radius: 10px; padding: 6px 10px; font-size: .8rem;
+      cursor: pointer;
+    }
+    .btn:active { transform: scale(.98); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    @media (min-width: 560px) {
+      .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    .card {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      min-height: 78px;
+    }
+    .card .label { color: var(--muted); font-size: .75rem; margin-bottom: 6px; }
+    .card .value { font-size: 1.25rem; font-weight: 700; word-break: break-all; }
+    .card .hint { color: var(--muted); font-size: .72rem; margin-top: 4px; }
+    .section-title {
+      display: flex; justify-content: space-between; align-items: baseline;
+      margin: 8px 2px 8px; font-weight: 600;
+    }
+    .section-title span { color: var(--muted); font-size: .78rem; font-weight: 400; }
+    .logs {
+      display: flex; flex-direction: column; gap: 8px;
+      max-height: 52vh; overflow: auto;
+      padding-right: 2px;
+      margin-bottom: 14px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .row {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 11px;
+      cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .row:hover, .row.active {
+      border-color: rgba(91,140,255,.45);
+      background: #17233a;
+    }
+    .row-top {
+      display: flex; justify-content: space-between; gap: 8px; align-items: center;
+      margin-bottom: 6px;
+    }
+    .time { color: var(--muted); font-size: .75rem; font-variant-numeric: tabular-nums; }
+    .badge {
+      font-size: .7rem; font-weight: 600;
+      border-radius: 999px; padding: 2px 8px;
+      border: 1px solid transparent;
+    }
+    .t-充值 { background: rgba(124,156,255,.15); color: #b7cbff; border-color: rgba(124,156,255,.3); }
+    .t-消费 { background: rgba(62,207,142,.12); color: #7eecc0; border-color: rgba(62,207,142,.3); }
+    .t-管理 { background: rgba(192,132,252,.12); color: #e0b5ff; border-color: rgba(192,132,252,.3); }
+    .t-系统 { background: rgba(148,163,184,.12); color: #cbd5e1; border-color: rgba(148,163,184,.3); }
+    .t-错误 { background: rgba(255,107,122,.12); color: #ffb0b8; border-color: rgba(255,107,122,.35); }
+    .t-退款 { background: rgba(56,189,248,.12); color: #7dd3fc; border-color: rgba(56,189,248,.3); }
+    .meta {
+      display: flex; flex-wrap: wrap; gap: 6px 10px;
+      font-size: .82rem; color: var(--text);
+    }
+    .meta b { font-weight: 600; }
+    .meta .muted { color: var(--muted); }
+    .content-line {
+      margin-top: 6px; color: var(--muted); font-size: .78rem;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .detail {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      min-height: 140px;
+    }
+    .detail h3 { margin: 0 0 8px; font-size: .95rem; }
+    .detail .empty { color: var(--muted); font-size: .85rem; }
+    .kv { display: grid; grid-template-columns: 88px 1fr; gap: 6px 8px; font-size: .82rem; }
+    .kv .k { color: var(--muted); }
+    .kv .v { word-break: break-all; }
+    pre.full {
+      margin: 10px 0 0;
+      padding: 10px;
+      background: #0a1020;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: .75rem;
+      color: #d7e2f5;
+      max-height: 240px;
+      overflow: auto;
+    }
+    .err { color: var(--bad); padding: 12px; }
+    .loading { color: var(--muted); padding: 20px 8px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>追觅客户监控 · Susciyuan</h1>
+      <div class="sub">
+        <span class="pill" id="scopePill">全站</span>
+        <span id="windowText">近 3 天</span>
+        <span id="genText"></span>
+        <button class="btn" id="refreshBtn" type="button">立即刷新</button>
+      </div>
+    </header>
+
+    <div id="errorBox" class="err" hidden></div>
+    <div id="loading" class="loading">加载中…</div>
+
+    <div id="app" hidden>
+      <div class="metrics" id="metrics"></div>
+
+      <div class="section-title">
+        日志列表
+        <span id="logMeta"></span>
+      </div>
+      <div class="logs" id="logs"></div>
+
+      <div class="section-title">详情面板 <span>点击错误或任意日志查看</span></div>
+      <div class="detail" id="detail">
+        <div class="empty">点击上方日志行查看完整内容、Request ID、状态码等。</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const TYPE_CLASS = {
+      "充值": "t-充值", "消费": "t-消费", "管理": "t-管理",
+      "系统": "t-系统", "错误": "t-错误", "退款": "t-退款"
+    };
+
+    function esc(s) {
+      return String(s ?? "").replace(/[&<>"']/g, c => ({
+        "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
+      })[c]);
+    }
+
+    function money(n) {
+      const x = Number(n || 0);
+      return "¥" + x.toFixed(2);
+    }
+
+    function renderMetrics(m) {
+      const cards = [
+        { label: "用量金额", value: money(m.usage_cny), hint: `配额 ${Math.round(m.usage_quota||0)} · ≈$${Number(m.usage_usd||0).toFixed(4)}` },
+        { label: "任务/请求总数", value: String(m.total_requests ?? 0), hint: `消费 ${m.consume_count||0} 条` },
+        { label: "错误总数", value: String(m.error_count ?? 0), hint: "type=错误" },
+        { label: "最多任务用户", value: m.top_task_user || "—", hint: `${m.top_task_count||0} 次消费` },
+        { label: "最多错误用户", value: m.top_error_user || "—", hint: `${m.top_error_count||0} 次错误` },
+      ];
+      document.getElementById("metrics").innerHTML = cards.map(c => `
+        <div class="card">
+          <div class="label">${esc(c.label)}</div>
+          <div class="value">${esc(c.value)}</div>
+          <div class="hint">${esc(c.hint)}</div>
+        </div>
+      `).join("");
+    }
+
+    let currentLogs = [];
+
+    function renderLogs(logs) {
+      currentLogs = logs || [];
+      const box = document.getElementById("logs");
+      if (!currentLogs.length) {
+        box.innerHTML = `<div class="empty" style="padding:16px;color:var(--muted)">窗口内暂无日志</div>`;
+        return;
+      }
+      box.innerHTML = currentLogs.map((l, idx) => {
+        const badgeCls = TYPE_CLASS[l.type_label] || "t-系统";
+        const cost = (l.type === 2 || (l.cost_cny && l.cost_cny > 0))
+          ? `<span class="muted">费用</span> <b>${esc(money(l.cost_cny))}</b>`
+          : `<span class="muted">费用</span> —`;
+        return `
+          <div class="row" data-idx="${idx}" role="button" tabindex="0">
+            <div class="row-top">
+              <span class="time">${esc(l.time)}</span>
+              <span class="badge ${badgeCls}">${esc(l.type_label)}</span>
+            </div>
+            <div class="meta">
+              <span><span class="muted">用户</span> <b>${esc(l.username || "—")}</b></span>
+              <span><span class="muted">模型</span> ${esc(l.model || "—")}</span>
+              <span><span class="muted">耗时</span> ${esc(l.duration || 0)}s</span>
+              <span>${cost}</span>
+            </div>
+            <div class="content-line">${esc(l.content_short || "")}</div>
+          </div>
+        `;
+      }).join("");
+
+      box.querySelectorAll(".row").forEach(el => {
+        el.addEventListener("click", () => selectLog(Number(el.dataset.idx)));
+        el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectLog(Number(el.dataset.idx)); }
+        });
+      });
+    }
+
+    function selectLog(idx) {
+      const l = currentLogs[idx];
+      if (!l) return;
+      document.querySelectorAll(".row").forEach((el, i) => el.classList.toggle("active", i === idx));
+      const detail = document.getElementById("detail");
+      const otherStr = l.other && Object.keys(l.other).length
+        ? JSON.stringify(l.other, null, 2)
+        : "";
+      detail.innerHTML = `
+        <h3>${esc(l.type_label)} · ${esc(l.username || "—")} · ${esc(l.time_full || l.time)}</h3>
+        <div class="kv">
+          <div class="k">Request ID</div><div class="v">${esc(l.request_id || "—")}</div>
+          <div class="k">状态码</div><div class="v">${esc(l.status_code ?? "—")}</div>
+          <div class="k">模型</div><div class="v">${esc(l.model || "—")}</div>
+          <div class="k">分组</div><div class="v">${esc(l.group || "—")}</div>
+          <div class="k">令牌</div><div class="v">${esc(l.token_name || "—")}</div>
+          <div class="k">渠道</div><div class="v">${esc(l.channel_name || "—")}</div>
+          <div class="k">耗时</div><div class="v">${esc(l.duration || 0)} 秒</div>
+          <div class="k">费用</div><div class="v">${esc(money(l.cost_cny))}（quota ${esc(l.quota)} / ≈$${esc(Number(l.cost_usd||0).toFixed(6))}）</div>
+          <div class="k">Tokens</div><div class="v">prompt ${esc(l.prompt_tokens)} · completion ${esc(l.completion_tokens)}</div>
+          <div class="k">IP</div><div class="v">${esc(l.ip || "—")}</div>
+          <div class="k">日志 ID</div><div class="v">${esc(l.id)}</div>
+        </div>
+        <pre class="full">${esc(l.content || "(无内容)")}</pre>
+        ${otherStr ? `<pre class="full">${esc(otherStr)}</pre>` : ""}
+      `;
+      detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    async function load(refresh) {
+      const errBox = document.getElementById("errorBox");
+      errBox.hidden = true;
+      try {
+        const url = "/api/overview" + (refresh ? "?refresh=1" : "");
+        const res = await fetch(url, { cache: "no-store" });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "加载失败");
+        document.getElementById("loading").hidden = true;
+        document.getElementById("app").hidden = false;
+        document.title = data.title || "追觅客户监控 · Susciyuan";
+        document.getElementById("scopePill").textContent = data.filter?.site_wide ? "全站 · 近3天" : "过滤模式";
+        document.getElementById("windowText").textContent =
+          `${data.window?.start || ""} ~ ${data.window?.end || ""} (${data.window?.tz || "CST"})`;
+        document.getElementById("genText").textContent =
+          `更新 ${data.generated_at || ""}${data.cached ? " · 缓存" : ""}`;
+        document.getElementById("logMeta").textContent =
+          `展示 ${data.log_returned}/${data.log_total_in_window}（上限 300）`;
+        renderMetrics(data.metrics || {});
+        renderLogs(data.logs || []);
+        // auto-select latest error if any
+        const errIdx = (data.logs || []).findIndex(l => l.type === 5);
+        if (errIdx >= 0) selectLog(errIdx);
+      } catch (e) {
+        document.getElementById("loading").hidden = true;
+        errBox.hidden = false;
+        errBox.textContent = "加载失败：" + (e.message || e);
+      }
+    }
+
+    document.getElementById("refreshBtn").addEventListener("click", () => load(true));
+    // JS backup refresh every 10 minutes (meta refresh also present)
+    setInterval(() => load(true), 600000);
+    load(false);
+  </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+.env
+*.env
+!.env.example
+susciyuan.env
+susciyuan-monitor-state.json
+*-state.json
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+*.html.bak
