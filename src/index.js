@@ -17,10 +17,12 @@ const TZ = "Asia/Shanghai";
 let cache = { ts: 0, status: null, logs: null };
 
 function envOf(runtime, key, fallback) {
+  const baked = (typeof globalThis !== "undefined" && globalThis.BAKED_ENV) || {};
+  const fromBaked = baked[key];
   const fromRt = runtime && runtime[key];
   const fromProc =
     typeof process !== "undefined" && process.env ? process.env[key] : undefined;
-  const raw = fromRt ?? fromProc ?? fallback ?? "";
+  const raw = (fromBaked && String(fromBaked).trim()) || fromRt || fromProc || fallback || "";
   return String(raw).trim();
 }
 

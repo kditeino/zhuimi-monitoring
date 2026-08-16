@@ -20,18 +20,20 @@
 仓库根目录的 `esa.jsonc` 是 ESA 的唯一构建配置（会覆盖控制台同名字段）：
 
 - `name`: `zhuimi-monitoring`
-- `entry`: `./src/index.js`（边缘函数）
+- `entry`: `./dist-worker/index.js`（边缘函数，由构建从 `src/index.js` 生成）
 - `installCommand` / `buildCommand`: 见 `esa.jsonc`（使用根目录 `package.json` 的 `build` 脚本）
 - `assets.directory`: `./dist`
 - `assets.notFoundStrategy`: `404Page`（不要用 `singlePageApplication`，否则浏览器对 `/api/*` 的 XHR 可能被回退成 `index.html`）
 
-构建脚本只把 `static/` 复制到 `dist/`（`dist/index.html`、`dist/404.html`），没有 React / Vite。
+构建脚本把 `static/` 复制到 `dist/`，并把 `src/index.js` 生成到 `dist-worker/index.js`（没有 React / Vite）。
+
+ESA 构建信息里的环境变量会在 `npm run build` 时打进边缘函数；改变量后要重新构建。不要把真实值写进仓库。
 
 ### 重建步骤
 
 1. 把代码推送到 GitHub 仓库 `main` 分支。
 2. ESA 控制台绑定该仓库后，推送会触发重建；也可在项目页手动重新部署。
-3. 在 ESA 控制台为**边缘函数运行时**配置环境变量（只填键名对应的值，不要写进仓库）。
+3. 在 ESA 控制台的**构建信息**里配置环境变量（只填键名对应的值，不要写进仓库）。
 4. 打开站点根路径查看看板；`GET /api/health`、`GET /api/overview` 由边缘函数处理。
 5. 若构建报找不到 `package.json`，确认仓库根目录已包含本文件，且根目录不是只含 Python。
 
@@ -96,7 +98,7 @@ python3 render_report.py --period evening
 
 - `esa.jsonc` — ESA Pages 构建与路由
 - `package.json` — ESA 构建脚本（无运行时依赖）
-- `scripts/build.mjs` — 将 `static/` 复制到 `dist/`
+- `scripts/build.mjs` — 将 `static/` 复制到 `dist/`，并生成 `dist-worker/index.js`
 - `src/index.js` — ESA 边缘函数（`/api/health`、`/api/overview`）
 - `static/index.html` — H5 界面（构建后进入 `dist/`）
 - `static/404.html` — ESA `404Page` 回退页

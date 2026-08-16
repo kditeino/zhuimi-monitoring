@@ -1,6 +1,6 @@
 {
   "name": "zhuimi-monitoring",
-  "entry": "./src/index.js",
+  "entry": "./dist-worker/index.js",
   "installCommand": "npm install",
   "buildCommand": "npm run build",
   "assets": {
@@ -8,3 +8,4 @@
     "notFoundStrategy": "404Page"
   }
 }
+
