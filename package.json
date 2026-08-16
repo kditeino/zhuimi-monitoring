@@ -1,0 +1,11 @@
+{
+  "name": "zhuimi-monitoring",
+  "private": true,
+  "description": "Zhuimi / Susciyuan internal H5 monitor - ESA Pages static build",
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

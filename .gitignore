@@ -10,3 +10,5 @@ __pycache__/
 .venv/
 venv/
 *.html.bak
+node_modules/
+dist/
