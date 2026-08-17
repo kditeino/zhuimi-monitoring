@@ -20,6 +20,13 @@ describe("balances and latest-log UI", { concurrency: 1 }, () => {
   });
 
   test("extractAwcoin reads AWCoin and ignores New API quota", () => {
+    assert.equal(
+      extractAwcoin({
+        code: 0,
+        data: { id: "u1", username: "demo", availableBalance: 123456, frozenBalance: 0 },
+      }),
+      123456
+    );
     assert.equal(extractAwcoin({ code: 0, data: { awcoin: 123456 } }), 123456);
     assert.equal(extractAwcoin({ code: 0, data: { balance: "88.5" } }), 88.5);
     assert.equal(extractAwcoin({ code: 0, data: { wallet: { aw_coin: 10 } } }), 10);
@@ -87,7 +94,7 @@ describe("balances and latest-log UI", { concurrency: 1 }, () => {
     assert.equal(calls, 0);
   });
 
-  test("GET /api/balances uses official AIPDD wallet + Volc billing, not New API quota", async () => {
+  test("GET /api/balances uses official AIPDD /user/info + Volc billing, not New API quota", async () => {
     const seen = [];
     globalThis.BAKED_ENV = {
       AIPDD_BASE_URL: "https://api.aipdd.work",
@@ -100,19 +107,16 @@ describe("balances and latest-log UI", { concurrency: 1 }, () => {
       const href = String(url);
       seen.push(href);
       const headers = (init && init.headers) || {};
-      if (href.includes("api.aipdd.work") && href.includes("/system/awcoin-rate")) {
-        return new Response(JSON.stringify({ code: 0, data: { rmb: 0.0001, usd: 0.00001484 } }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      if (href.includes("api.aipdd.work") && href.includes("/v1/user")) {
+      if (href.includes("api.aipdd.work") && href.includes("/user/info")) {
         assert.equal(headers["X-API-Key"], "official-key");
         assert.equal(headers.Authorization, "Bearer official-key");
-        return new Response(JSON.stringify({ code: 0, data: { awcoin: 123456 } }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: { id: "u1", username: "demo", availableBalance: 123456, frozenBalance: 10 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
       }
       if (href.includes("billing.volcengineapi.com")) {
         assert.match(href, /Action=QueryBalanceAcct/);
@@ -136,12 +140,18 @@ describe("balances and latest-log UI", { concurrency: 1 }, () => {
     assert.equal(body.aipdd.configured, true);
     assert.equal(body.aipdd.awcoin, 123456);
     assert.equal(body.aipdd.cny, 12.3456);
+    assert.equal(body.aipdd.frozenBalance, 10);
+    assert.equal(body.aipdd.error, null);
     assert.equal(body.volces.configured, true);
     assert.equal(body.volces.cny, 77.01);
     assert.equal(body.volces.currency, "CNY");
     assert.ok(seen.length <= 4);
-    assert.ok(seen.some((u) => u.includes("/v1/user")));
+    assert.equal(seen.filter((u) => u.includes("api.aipdd.work")).length, 1);
+    assert.ok(seen.some((u) => u.includes("/user/info")));
     assert.ok(seen.some((u) => u.includes("billing.volcengineapi.com")));
+    assert.ok(!seen.some((u) => u.includes("/system/awcoin-rate")));
+    assert.ok(!seen.some((u) => u.includes("/v1/")));
+    assert.ok(!seen.some((u) => u.includes("/api/user/self")));
     assert.ok(!seen.some((u) => u.includes("susciyuan")));
     assert.ok(!seen.some((u) => u.includes("newapi.aipdd.work")));
     assert.ok(!seen.some((u) => u.includes("update_balance")));
@@ -150,14 +160,7 @@ describe("balances and latest-log UI", { concurrency: 1 }, () => {
 
   test("GET /api/balances does not treat New API quota as AIPDD remaining", async () => {
     globalThis.BAKED_ENV = { AIPDD_API_KEY: "official-key" };
-    globalThis.fetch = async (url) => {
-      const href = String(url);
-      if (href.includes("/system/awcoin-rate")) {
-        return new Response(JSON.stringify({ code: 0, data: { rmb: 0.0001 } }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
+    globalThis.fetch = async () => {
       return new Response(JSON.stringify({ success: true, data: { quota: 1000000, used_quota: 200000 } }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -167,7 +170,20 @@ describe("balances and latest-log UI", { concurrency: 1 }, () => {
     const body = await res.json();
     assert.equal(body.aipdd.configured, true);
     assert.equal(body.aipdd.cny, null);
-    assert.equal(body.aipdd.error, "AIPDD 余额查询失败");
+    assert.equal(body.aipdd.error, "AIPDD 余额解析失败");
+  });
+
+  test("GET /api/balances reports invalid key on HTTP 401/403", async () => {
+    globalThis.BAKED_ENV = { AIPDD_API_KEY: "official-key" };
+    globalThis.fetch = async () => new Response(JSON.stringify({ code: 401, data: null }), { status: 401 });
+    let res = await worker.fetch(new Request("https://monitor.test/api/balances?refresh=1"), {});
+    let body = await res.json();
+    assert.equal(body.aipdd.error, "AIPDD 钥匙无效");
+    resetBalancesState();
+    globalThis.fetch = async () => new Response(JSON.stringify({ code: 403, data: null }), { status: 403 });
+    res = await worker.fetch(new Request("https://monitor.test/api/balances?refresh=1"), {});
+    body = await res.json();
+    assert.equal(body.aipdd.error, "AIPDD 钥匙无效");
   });
 
   test("GET /api/balances does not leak upstream text on failure", async () => {
@@ -253,5 +269,17 @@ describe("balances and latest-log UI", { concurrency: 1 }, () => {
     assert.ok(!src.includes("AIPDD_ACCESS_TOKEN"));
     assert.ok(!src.includes("AIPDD_USER_ID"));
     assert.ok(!src.includes("VOLCES_CHANNEL_ID"));
+  });
+
+  test("worker uses only GET /user/info for AIPDD remaining", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "index.js"), "utf8");
+    assert.ok(src.includes("/user/info"));
+    assert.ok(src.includes("availableBalance"));
+    assert.ok(!src.includes("probeAipddWallet"));
+    assert.ok(!src.includes("/v1/user"));
+    assert.ok(!src.includes("/v1/wallet"));
+    assert.ok(!src.includes("/v1/account"));
+    assert.ok(!src.includes("/v1/balance"));
+    assert.ok(!src.includes("/api/user/self"));
   });
 });
