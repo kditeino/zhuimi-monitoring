@@ -14,6 +14,10 @@ const BAKE_KEYS = [
   "SUSCIYUAN_USER_ID",
   "DASHBOARD_USER",
   "DASHBOARD_PASSWORD",
+  "AIPDD_BASE",
+  "AIPDD_ACCESS_TOKEN",
+  "AIPDD_USER_ID",
+  "VOLCES_CHANNEL_ID",
 ];
 
 function bakedEnvLiteral() {

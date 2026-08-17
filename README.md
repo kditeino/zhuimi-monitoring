@@ -29,6 +29,8 @@
 
 ESA 构建信息里的环境变量会在 `npm run build` 时打进边缘函数；改变量后要重新构建。不要把真实值写进仓库。
 
+ESA 构建环境变量还要加上 `AIPDD_BASE`、`AIPDD_ACCESS_TOKEN`、`AIPDD_USER_ID`、`VOLCES_CHANNEL_ID`（只加名字，不要写真实值），加完后重新构建。
+
 ### 重建步骤
 
 1. 把代码推送到 GitHub 仓库 `main` 分支。
@@ -78,6 +80,10 @@ python3 render_report.py --period evening
 | `SUSCIYUAN_USER_ID` | New API 用户 id（默认 `1`） |
 | `DASHBOARD_USER` | 看板 HTTP Basic 用户名（默认 `zhuimi`） |
 | `DASHBOARD_PASSWORD` | 看板 HTTP Basic 密码（未设置则不启用鉴权） |
+| `AIPDD_BASE` | AIPDD New API 根 URL（默认 `https://api.aipdd.work`） |
+| `AIPDD_ACCESS_TOKEN` | AIPDD 管理员令牌（仅服务端 / 边缘函数；未配置则余额卡显示「待配置」） |
+| `AIPDD_USER_ID` | AIPDD 用户 id（默认 `1`） |
+| `VOLCES_CHANNEL_ID` | AIPDD 上火山引擎渠道 id（未配置则该卡显示「待配置」） |
 | `HOST` | Python 监听地址，默认 `0.0.0.0` |
 | `PORT` | Python 监听端口，默认 `8787` |
 | `SUSCIYUAN_ENV` | env 文件路径，默认仓库根目录 `.env` |
@@ -90,6 +96,7 @@ python3 render_report.py --period evening
 |------|------|
 | `GET /` | H5 看板（ESA 静态 `dist/index.html`，或 Python 读取 `static/index.html`） |
 | `GET /api/overview` | 指标 + 近 3 天日志（`?refresh=1` 跳过缓存） |
+| `GET /api/balances` | AIPDD / 火山引擎剩余金额（`?refresh=1` 跳过约 45s 缓存；不增加 overview 出站请求） |
 | `GET /api/report?hours=12` | 结构化摘要（仅 Python） |
 | `GET /api/report?period=morning / evening` | 半天窗口摘要（仅 Python） |
 | `GET /api/health` | 存活检查 |
@@ -99,7 +106,7 @@ python3 render_report.py --period evening
 - `esa.jsonc` — ESA Pages 构建与路由
 - `package.json` — ESA 构建脚本（无运行时依赖）
 - `scripts/build.mjs` — 将 `static/` 复制到 `dist/`，并生成 `dist-worker/index.js`
-- `src/index.js` — ESA 边缘函数（`/api/health`、`/api/overview`）
+- `src/index.js` — ESA 边缘函数（`/api/health`、`/api/overview`、`/api/balances`）
 - `static/index.html` — H5 界面（构建后进入 `dist/`）
 - `static/404.html` — ESA `404Page` 回退页
 - `app.py` — Python 看板服务
@@ -112,5 +119,5 @@ python3 render_report.py --period evening
 ## 安全
 
 - 不要提交 `.env`、`*.env`、`susciyuan.env` 或状态 JSON
-- 不要把 `SUSCIYUAN_ACCESS_TOKEN` 写进前端或 README
+- 不要把 `SUSCIYUAN_ACCESS_TOKEN` 或 `AIPDD_ACCESS_TOKEN` 写进前端或 README
 - 边缘函数失败时只返回 `{ok:false,error}`，不会回传 token

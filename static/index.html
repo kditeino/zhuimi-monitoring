@@ -500,10 +500,32 @@
       return "¥" + Number(n || 0).toFixed(2);
     }
 
-    function renderMetrics(m) {
+    function balanceCard(label, item, missingHint) {
+      const row = item || {};
+      if (!row.configured) {
+        return { label: label, value: "待配置", hint: row.error || missingHint, cls: "money" };
+      }
+      if (row.error || row.cny == null || !Number.isFinite(Number(row.cny))) {
+        return { label: label, value: "—", hint: row.error || "查询失败", cls: "money" };
+      }
+      let hint = "≈$" + Number(row.usd || 0).toFixed(4);
+      if (label.indexOf("火山") >= 0) {
+        hint = row.currency === "CNY"
+          ? "渠道余额（人民币）· ≈$" + Number(row.usd || 0).toFixed(4)
+          : "渠道余额按 USD × 汇率 · ≈$" + Number(row.usd || 0).toFixed(4);
+      } else if (row.quota_remain != null) {
+        hint = "剩余配额 " + Math.round(row.quota_remain) + " · ≈$" + Number(row.usd || 0).toFixed(4);
+      }
+      return { label: label, value: money(row.cny), hint: hint, cls: "money" };
+    }
+
+    function renderMetrics(m, balances) {
       const errN = Number(m.error_count || 0);
+      const bal = balances || {};
       const cards = [
         { label: "用量金额", value: money(m.usage_cny), hint: "配额 " + Math.round(m.usage_quota||0) + " · ≈$" + Number(m.usage_usd||0).toFixed(4), cls: "money" },
+        balanceCard("AIPDD剩余金额", bal.aipdd, "尚未配置 AIPDD_ACCESS_TOKEN"),
+        balanceCard("火山引擎剩余金额", bal.volces, "尚未配置 VOLCES_CHANNEL_ID"),
         { label: "任务 / 请求", value: String(m.total_requests ?? 0), hint: "消费 " + (m.consume_count||0) + " 条", cls: "" },
         { label: "错误总数", value: String(errN), hint: "type = 错误", cls: "error" },
         { label: "最多任务用户", value: m.top_task_user || "—", hint: (m.top_task_count||0) + " 次消费", cls: "" },
@@ -578,7 +600,7 @@
       return '<div class="k">' + esc(k) + '</div><div class="v' + (cls ? ' ' + cls : '') + '">' + v + '</div>';
     }
 
-    function selectLog(idx) {
+    function selectLog(idx, opts) {
       const l = currentLogs[idx];
       if (!l) return;
       document.querySelectorAll(".row").forEach((el, i) => el.classList.toggle("active", i === idx));
@@ -602,7 +624,26 @@
         '</div>' +
         '<pre class="full">' + esc(l.content || "(无内容)") + '</pre>' +
         (otherStr ? '<pre class="full">' + esc(otherStr) + '</pre>' : '');
-      detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      if (!opts || opts.scrollDetail !== false) {
+        detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+    }
+
+    function revealLatestLog() {
+      if (!currentLogs.length) return;
+      selectLog(0, { scrollDetail: false });
+      const box = document.getElementById("logs");
+      if (!box) return;
+      box.scrollTop = 0;
+      const row = box.querySelector(".row");
+      if (!row) return;
+      const rowRect = row.getBoundingClientRect();
+      const header = document.querySelector("header.top");
+      const headerH = header ? header.getBoundingClientRect().height : 0;
+      if (rowRect.top < headerH + 4 || rowRect.bottom > window.innerHeight) {
+        const top = window.scrollY + rowRect.top - headerH - 8;
+        window.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+      }
     }
 
     async function load(refresh) {
@@ -615,10 +656,23 @@
       btn.textContent = "刷新中";
       if (app.classList.contains("hidden")) loading.classList.remove("hidden");
       try {
-        const url = "/api/overview" + (refresh ? "?refresh=1" : "");
-        const res = await fetch(url, { cache: "no-store" });
-        const data = await res.json();
+        const q = refresh ? "?refresh=1" : "";
+        const [ovSettled, balSettled] = await Promise.allSettled([
+          fetch("/api/overview" + q, { cache: "no-store" }).then((res) => res.json()),
+          fetch("/api/balances" + q, { cache: "no-store" }).then((res) => res.json()),
+        ]);
+        if (ovSettled.status !== "fulfilled") throw ovSettled.reason || new Error("加载失败");
+        const data = ovSettled.value;
         if (!data.ok) throw new Error(data.error || "加载失败");
+        let balances = { aipdd: { configured: false }, volces: { configured: false } };
+        if (balSettled.status === "fulfilled" && balSettled.value && balSettled.value.ok) {
+          balances = balSettled.value;
+        } else if (balSettled.status === "fulfilled" && balSettled.value && !balSettled.value.ok) {
+          balances = {
+            aipdd: { configured: true, error: "查询失败" },
+            volces: { configured: true, error: "查询失败" },
+          };
+        }
         loading.classList.add("hidden");
         app.classList.remove("hidden");
         document.title = data.title || "追觅客户监控 · Susciyuan";
@@ -630,11 +684,10 @@
           "更新 " + (data.generated_at || "") + (data.cached ? " · 缓存" : "");
         document.getElementById("logMeta").textContent =
           "展示 " + data.log_returned + "/" + data.log_total_in_window + "（上限 300）";
-        renderMetrics(data.metrics || {});
+        renderMetrics(data.metrics || {}, balances);
         renderChips(data.type_counts || {}, data.top_models || []);
         renderLogs(data.logs || []);
-        const errIdx = (data.logs || []).findIndex(l => l.type === 5);
-        if (errIdx >= 0) selectLog(errIdx);
+        revealLatestLog();
       } catch (e) {
         loading.classList.add("hidden");
         errBox.classList.remove("hidden");

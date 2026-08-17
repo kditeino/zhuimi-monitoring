@@ -87,6 +87,7 @@ TYPE_LABELS = {
 
 _cache_lock = threading.Lock()
 _cache: dict[str, Any] = {"ts": 0.0, "status": None, "logs": None}
+_balances_cache: dict[str, Any] = {"ts": 0.0, "payload": None}
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -463,6 +464,161 @@ def build_report(env: dict[str, str], hours: int | None = None, period: str | No
     }
 
 
+def _empty_aipdd(error: str | None) -> dict[str, Any]:
+    return {"configured": False, "cny": None, "usd": None, "quota_remain": None, "error": error}
+
+
+def _empty_volces(error: str | None) -> dict[str, Any]:
+    return {"configured": False, "cny": None, "usd": None, "error": error}
+
+
+def _parse_channel_balance(payload: Any) -> tuple[float | None, str | None]:
+    if isinstance(payload, (int, float)) and not isinstance(payload, bool):
+        return float(payload), None
+    if not isinstance(payload, dict):
+        return None, None
+    nested = payload.get("data") if isinstance(payload.get("data"), dict) else None
+
+    def _currency(obj: Any) -> str | None:
+        if not isinstance(obj, dict):
+            return None
+        raw = str(obj.get("currency") or obj.get("Currency") or obj.get("quota_display_type") or "").strip().upper()
+        if raw in ("CNY", "RMB"):
+            return "CNY"
+        if raw == "USD":
+            return "USD"
+        return None
+
+    currency = _currency(nested) or _currency(payload)
+    named = [
+        ("balance_cny", payload.get("balance_cny"), "CNY"),
+        ("balance_cny", (nested or {}).get("balance_cny"), "CNY"),
+        ("cny", payload.get("cny"), "CNY"),
+        ("cny", (nested or {}).get("cny"), "CNY"),
+        ("balance", payload.get("balance"), currency),
+        ("data", payload.get("data") if not isinstance(payload.get("data"), dict) else None, currency),
+        ("balance", (nested or {}).get("balance"), currency),
+        ("usd", (nested or {}).get("usd"), "USD"),
+        ("usd", payload.get("usd"), "USD"),
+    ]
+    for _name, cand, forced in named:
+        if isinstance(cand, bool):
+            continue
+        if isinstance(cand, (int, float)):
+            return float(cand), forced
+        if isinstance(cand, str) and cand.strip():
+            try:
+                return float(cand), forced
+            except ValueError:
+                continue
+    return None, None
+
+
+def build_balances(env: dict[str, str], force: bool = False) -> dict[str, Any]:
+    """AIPDD / Volcengine remaining balances. Missing keys stay unconfigured."""
+    now = datetime.now(TZ_SH)
+    generated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+    base = (env.get("AIPDD_BASE") or "https://api.aipdd.work").rstrip("/")
+    token = (env.get("AIPDD_ACCESS_TOKEN") or "").strip()
+    user_id = (env.get("AIPDD_USER_ID") or "1").strip() or "1"
+    channel_id = (env.get("VOLCES_CHANNEL_ID") or "").strip()
+
+    if not token:
+        return {
+            "ok": True,
+            "aipdd": _empty_aipdd("未配置 AIPDD_ACCESS_TOKEN"),
+            "volces": _empty_volces("未配置 AIPDD_ACCESS_TOKEN" if channel_id else "未配置 VOLCES_CHANNEL_ID"),
+            "generated_at": generated_at,
+            "cached": False,
+        }
+
+    with _cache_lock:
+        cached_payload = _balances_cache.get("payload")
+        cached_ts = float(_balances_cache.get("ts") or 0)
+    if not force and cached_payload is not None and (time.time() - cached_ts) < CACHE_TTL_SEC:
+        out = dict(cached_payload)
+        out["cached"] = True
+        return out
+
+    status: dict[str, Any] = {}
+    try:
+        payload = api_get(base, token, user_id, "/api/status", {})
+        status = payload.get("data") or {}
+    except Exception:
+        status = {}
+    qpu = float(status.get("quota_per_unit") or 500000) or 500000
+    rate = float(status.get("usd_exchange_rate") or status.get("price") or 7.3) or 7.3
+
+    try:
+        self_payload = api_get(base, token, user_id, "/api/user/self", {})
+        if not self_payload.get("success", True):
+            raise RuntimeError("self failed")
+        user = self_payload.get("data") or {}
+        remain = float(user.get("quota") or 0)
+        money = money_from_quota(remain, qpu, rate)
+        aipdd = {
+            "configured": True,
+            "cny": money["cny"],
+            "usd": money["usd"],
+            "quota_remain": remain,
+            "error": None,
+        }
+    except Exception:
+        aipdd = {
+            "configured": True,
+            "cny": None,
+            "usd": None,
+            "quota_remain": None,
+            "error": "AIPDD 余额查询失败",
+        }
+
+    if not channel_id:
+        volces: dict[str, Any] = _empty_volces("未配置 VOLCES_CHANNEL_ID")
+    else:
+        try:
+            bal_payload = api_get(base, token, user_id, f"/api/channel/update_balance/{channel_id}", {})
+            if bal_payload.get("success") is False:
+                raise RuntimeError("balance failed")
+            raw, currency = _parse_channel_balance(bal_payload)
+            if raw is None:
+                raise RuntimeError("no balance")
+            if currency == "CNY":
+                volces = {
+                    "configured": True,
+                    "cny": round(raw, 4),
+                    "usd": round(raw / rate, 6),
+                    "error": None,
+                    "currency": "CNY",
+                }
+            else:
+                volces = {
+                    "configured": True,
+                    "cny": round(raw * rate, 4),
+                    "usd": round(raw, 6),
+                    "error": None,
+                    "currency": "USD",
+                }
+        except Exception:
+            volces = {
+                "configured": True,
+                "cny": None,
+                "usd": None,
+                "error": "火山引擎余额查询失败",
+            }
+
+    payload = {
+        "ok": True,
+        "aipdd": aipdd,
+        "volces": volces,
+        "generated_at": datetime.now(TZ_SH).strftime("%Y-%m-%d %H:%M:%S"),
+        "cached": False,
+    }
+    with _cache_lock:
+        _balances_cache["ts"] = time.time()
+        _balances_cache["payload"] = payload
+    return payload
+
+
 class Handler(BaseHTTPRequestHandler):
     env: dict[str, str] = {}
 
@@ -517,6 +673,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/overview":
                 force = qs.get("refresh", ["0"])[0] in ("1", "true", "yes")
                 self._json(200, build_overview(self.env, force=force))
+                return
+            if path == "/api/balances":
+                force = qs.get("refresh", ["0"])[0] in ("1", "true", "yes")
+                self._json(200, build_balances(env, force=force))
                 return
             if path == "/api/report":
                 hours = None

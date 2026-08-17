@@ -15,6 +15,7 @@ const CACHE_TTL_MS = 45000;
 const TZ = "Asia/Shanghai";
 
 let cache = { ts: 0, status: null, logs: null };
+let balancesCache = { ts: 0, payload: null };
 
 function envOf(runtime, key, fallback) {
   const baked = (typeof globalThis !== "undefined" && globalThis.BAKED_ENV) || {};
@@ -110,6 +111,92 @@ function moneyFromQuota(quota, quotaPerUnit, usdRate) {
   const usd = quotaPerUnit ? q / quotaPerUnit : 0;
   const cny = usd * usdRate;
   return { quota: q, usd: roundN(usd, 6), cny: roundN(cny, 4) };
+}
+
+function isRefresh(url) {
+  const refreshRaw = (url.searchParams.get("refresh") || "0").toLowerCase();
+  return refreshRaw === "1" || refreshRaw === "true" || refreshRaw === "yes";
+}
+
+function conversionFromStatus(status) {
+  const src = status && typeof status === "object" ? status : {};
+  const quotaPerUnit = Number(src.quota_per_unit || 500000);
+  const usdRate = Number(src.usd_exchange_rate || src.price || 7.3);
+  return {
+    quota_per_unit: quotaPerUnit > 0 ? quotaPerUnit : 500000,
+    usd_exchange_rate: usdRate > 0 ? usdRate : 7.3,
+  };
+}
+
+function remainQuotaFromUser(user) {
+  const src = user && typeof user === "object" ? user : {};
+  // New API: quota is remaining; used_quota is cumulative consumed.
+  // Do not subtract used_quota (that would under-count the live balance).
+  const quota = Number(src.quota || 0);
+  return Number.isFinite(quota) ? quota : 0;
+}
+
+function inferBalanceCurrency(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const raw = obj.currency || obj.Currency || obj.quota_display_type || "";
+  const c = String(raw).trim().toUpperCase();
+  if (c === "CNY" || c === "RMB") return "CNY";
+  if (c === "USD") return "USD";
+  return null;
+}
+
+function parseChannelBalance(payload) {
+  if (payload == null) return { value: null, currency: null };
+  if (typeof payload === "number" && Number.isFinite(payload)) {
+    return { value: payload, currency: null };
+  }
+  if (typeof payload !== "object") return { value: null, currency: null };
+  const nested = payload.data && typeof payload.data === "object" ? payload.data : null;
+  const currency = inferBalanceCurrency(nested) || inferBalanceCurrency(payload);
+  const candidates = [
+    payload.balance_cny,
+    nested && nested.balance_cny,
+    payload.cny,
+    nested && nested.cny,
+    payload.balance,
+    payload.data,
+    nested && nested.balance,
+    nested && nested.usd,
+    payload.usd,
+  ];
+  for (const cand of candidates) {
+    if (typeof cand === "number" && Number.isFinite(cand)) {
+      const forced =
+        cand === payload.balance_cny ||
+        cand === (nested && nested.balance_cny) ||
+        cand === payload.cny ||
+        cand === (nested && nested.cny)
+          ? "CNY"
+          : cand === payload.usd || cand === (nested && nested.usd)
+            ? "USD"
+            : currency;
+      return { value: cand, currency: forced };
+    }
+    if (typeof cand === "string" && cand.trim() && !Number.isNaN(Number(cand))) {
+      return { value: Number(cand), currency };
+    }
+  }
+  return { value: null, currency };
+}
+
+function channelMoney(rawValue, currency, usdRate) {
+  const n = Number(rawValue);
+  if (!Number.isFinite(n)) return { cny: null, usd: null, currency: currency || "USD" };
+  if (currency === "CNY") {
+    const rate = usdRate > 0 ? usdRate : 7.3;
+    return { cny: roundN(n, 4), usd: roundN(n / rate, 6), currency: "CNY" };
+  }
+  const rate = usdRate > 0 ? usdRate : 7.3;
+  return { cny: roundN(n * rate, 4), usd: roundN(n, 6), currency: "USD" };
+}
+
+function safeBalanceError(fallback) {
+  return fallback || "查询失败";
 }
 
 function parseOther(raw) {
@@ -343,8 +430,7 @@ async function handleOverview(request, runtime) {
     return json(500, { ok: false, error: "missing SUSCIYUAN_ACCESS_TOKEN" });
   }
   const url = new URL(request.url);
-  const refreshRaw = (url.searchParams.get("refresh") || "0").toLowerCase();
-  const refresh = refreshRaw === "1" || refreshRaw === "true" || refreshRaw === "yes";
+  const refresh = isRefresh(url);
   const now = Date.now();
   let status = cache.status;
   let rawLogs = cache.logs;
@@ -361,6 +447,137 @@ async function handleOverview(request, runtime) {
   }
   return json(200, buildOverview(status, rawLogs, cached));
 }
+
+function emptyAipdd(error) {
+  return { configured: false, cny: null, usd: null, quota_remain: null, error: error || null };
+}
+
+function emptyVolces(error) {
+  return { configured: false, cny: null, usd: null, error: error || null };
+}
+
+async function handleBalances(request, runtime) {
+  const base = envOf(runtime, "AIPDD_BASE", "https://api.aipdd.work").replace(/\/+$/, "");
+  const token = envOf(runtime, "AIPDD_ACCESS_TOKEN", "");
+  const userId = envOf(runtime, "AIPDD_USER_ID", "1") || "1";
+  const channelId = envOf(runtime, "VOLCES_CHANNEL_ID", "");
+  const generatedAt = formatFull(new Date());
+
+  if (!token) {
+    return json(200, {
+      ok: true,
+      aipdd: emptyAipdd("未配置 AIPDD_ACCESS_TOKEN"),
+      volces: emptyVolces(channelId ? "未配置 AIPDD_ACCESS_TOKEN" : "未配置 VOLCES_CHANNEL_ID"),
+      generated_at: generatedAt,
+      cached: false,
+    });
+  }
+
+  const url = new URL(request.url);
+  const refresh = isRefresh(url);
+  const now = Date.now();
+  if (!refresh && balancesCache.payload && now - balancesCache.ts < CACHE_TTL_MS) {
+    return json(200, Object.assign({}, balancesCache.payload, { cached: true }));
+  }
+
+  const wantVolces = Boolean(channelId);
+  const statusP = fetchStatus(base, token, userId).catch(function () {
+    return null;
+  });
+  const selfP = apiGet(base, token, userId, "/api/user/self", null).then(
+    function (payload) {
+      return { ok: true, payload: payload };
+    },
+    function () {
+      return { ok: false };
+    }
+  );
+  const volcesP = wantVolces
+    ? apiGet(base, token, userId, "/api/channel/update_balance/" + encodeURIComponent(channelId), null).then(
+        function (payload) {
+          return { ok: true, payload: payload };
+        },
+        function () {
+          return { ok: false };
+        }
+      )
+    : Promise.resolve(null);
+
+  const settled = await Promise.all([statusP, selfP, volcesP]);
+  const conv = conversionFromStatus(settled[0]);
+  const selfRes = settled[1];
+  const volcesRes = settled[2];
+
+  let aipdd;
+  if (!selfRes.ok || !selfRes.payload || selfRes.payload.success === false) {
+    aipdd = {
+      configured: true,
+      cny: null,
+      usd: null,
+      quota_remain: null,
+      error: safeBalanceError("AIPDD 余额查询失败"),
+    };
+  } else {
+    const user = selfRes.payload.data || {};
+    const remain = remainQuotaFromUser(user);
+    const money = moneyFromQuota(remain, conv.quota_per_unit, conv.usd_exchange_rate);
+    aipdd = {
+      configured: true,
+      cny: money.cny,
+      usd: money.usd,
+      quota_remain: remain,
+      error: null,
+    };
+  }
+
+  let volces;
+  if (!wantVolces) {
+    volces = emptyVolces("未配置 VOLCES_CHANNEL_ID");
+  } else if (!volcesRes || !volcesRes.ok || !volcesRes.payload || volcesRes.payload.success === false) {
+    volces = {
+      configured: true,
+      cny: null,
+      usd: null,
+      error: safeBalanceError("火山引擎余额查询失败"),
+    };
+  } else {
+    const parsed = parseChannelBalance(volcesRes.payload);
+    if (parsed.value == null) {
+      volces = {
+        configured: true,
+        cny: null,
+        usd: null,
+        error: safeBalanceError("火山引擎余额查询失败"),
+      };
+    } else {
+      const money = channelMoney(parsed.value, parsed.currency, conv.usd_exchange_rate);
+      volces = {
+        configured: true,
+        cny: money.cny,
+        usd: money.usd,
+        error: null,
+        currency: money.currency,
+      };
+    }
+  }
+
+  const payload = {
+    ok: true,
+    aipdd: aipdd,
+    volces: volces,
+    generated_at: formatFull(new Date()),
+    cached: false,
+  };
+  balancesCache = { ts: Date.now(), payload: payload };
+  return json(200, payload);
+}
+
+export {
+  remainQuotaFromUser,
+  parseChannelBalance,
+  channelMoney,
+  conversionFromStatus,
+};
 
 export default {
   async fetch(request, env) {
@@ -386,6 +603,9 @@ export default {
       }
       if (path === "/api/overview") {
         return await handleOverview(request, runtime);
+      }
+      if (path === "/api/balances") {
+        return await handleBalances(request, runtime);
       }
       return json(404, { ok: false, error: "not found" });
     } catch (err) {
