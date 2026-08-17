@@ -15,6 +15,25 @@ const CACHE_TTL_MS = 45000;
 const TZ = "Asia/Shanghai";
 
 let cache = { ts: 0, status: null, logs: null };
+let balancesCache = { ts: 0, payload: null };
+let aipddWalletPath = "";
+let aipddFailedPaths = [];
+let awcoinRateCache = { ts: 0, rmb: 0.0001, usd: 0.00001484 };
+
+const AIPDD_DEFAULT_BASE = "https://api.aipdd.work";
+const AIPDD_RATE_PATH = "/system/awcoin-rate";
+const DEFAULT_AWCOIN_RMB = 0.0001;
+// Probe order on official AIPDD (AWCoin). Unauthenticated GETs to all five
+// return AIPDD-style 401 {code,message,data}, so they exist. Runtime caches
+// the first path that yields a usable AWCoin balance. Do not call
+// newapi.aipdd.work (ImpToken) or susciyuan /api/user/self here.
+const AIPDD_WALLET_PATHS = ["/v1/user", "/v1/wallet", "/v1/account", "/v1/balance", "/api/user/self"];
+const VOLC_BILLING_HOST = "billing.volcengineapi.com";
+const VOLC_BILLING_SERVICE = "billing";
+const VOLC_BILLING_REGION = "cn-north-1";
+const VOLC_CONTENT_TYPE = "application/x-www-form-urlencoded";
+const RATE_CACHE_TTL_MS = 60 * 60 * 1000;
+const MAX_BALANCES_SUBREQ = 4;
 
 function envOf(runtime, key, fallback) {
   const baked = (typeof globalThis !== "undefined" && globalThis.BAKED_ENV) || {};
@@ -36,15 +55,29 @@ function json(status, obj) {
   });
 }
 
-function unauthorized() {
-  return new Response("Unauthorized", {
+const SESSION_COOKIE = "zm_sid";
+const SESSION_DAYS = 7;
+const SESSION_PEPPER = "zhuimi-monitor-session-v1";
+
+function jsonUnauthorized() {
+  return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
     status: 401,
     headers: {
-      "WWW-Authenticate": 'Basic realm="Zhuimi Monitor"',
-      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
     },
   });
+}
+
+function htmlPage(status, body, extraHeaders) {
+  const headers = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+  };
+  if (extraHeaders) {
+    for (const [k, v] of Object.entries(extraHeaders)) headers[k] = v;
+  }
+  return new Response(body, { status: status, headers: headers });
 }
 
 function safeEqual(a, b) {
@@ -59,17 +92,117 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-function checkBasic(request, user, password) {
-  const header = request.headers.get("Authorization") || "";
-  if (!header.startsWith("Basic ")) return false;
+function cookieHeader(request, name) {
+  const raw = request.headers.get("Cookie") || "";
+  const parts = raw.split(";");
+  for (let i = 0; i < parts.length; i++) {
+    const piece = parts[i].trim();
+    const eq = piece.indexOf("=");
+    if (eq < 0) continue;
+    if (piece.slice(0, eq) === name) return piece.slice(eq + 1);
+  }
+  return "";
+}
+
+function b64urlEncode(text) {
+  return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function b64urlDecode(text) {
+  const s = String(text || "").replace(/-/g, "+").replace(/_/g, "/");
+  const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+  return atob(s + pad);
+}
+
+async function sessionKeyBytes(password) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(password) + SESSION_PEPPER));
+  return new Uint8Array(digest);
+}
+
+async function signSessionPayload(password, payload) {
+  const sig = await hmacSha256Raw(await sessionKeyBytes(password), payload);
+  return hexFromBuf(sig);
+}
+
+async function makeSessionToken(user, password, nowMs) {
+  const exp = Math.floor(Number(nowMs || Date.now()) / 1000) + SESSION_DAYS * 86400;
+  const payload = "v1|" + String(user) + "|" + exp;
+  return b64urlEncode(payload) + "." + (await signSessionPayload(password, payload));
+}
+
+async function verifySessionToken(token, user, password, nowMs) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 2) return false;
+  let payload = "";
   try {
-    const raw = atob(header.slice(6).trim());
-    const idx = raw.indexOf(":");
-    if (idx < 0) return false;
-    return safeEqual(raw.slice(0, idx), user) && safeEqual(raw.slice(idx + 1), password);
+    payload = b64urlDecode(parts[0]);
   } catch {
     return false;
   }
+  const expected = await signSessionPayload(password, payload);
+  if (!safeEqual(expected, parts[1])) return false;
+  const bits = payload.split("|");
+  if (bits.length !== 3 || bits[0] !== "v1" || !safeEqual(bits[1], user)) return false;
+  const exp = Number(bits[2]);
+  return Number.isFinite(exp) && exp > Math.floor(Number(nowMs || Date.now()) / 1000);
+}
+
+function sessionCookieValue(token, requestUrl, clear) {
+  const secure = String(requestUrl || "").startsWith("https:") ? "; Secure" : "";
+  if (clear) {
+    return SESSION_COOKIE + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax" + secure;
+  }
+  const maxAge = SESSION_DAYS * 86400;
+  return (
+    SESSION_COOKIE +
+    "=" +
+    token +
+    "; Path=/; Max-Age=" +
+    maxAge +
+    "; HttpOnly; SameSite=Lax" +
+    secure
+  );
+}
+
+function renderLoginPage(error) {
+  const baked = typeof globalThis !== "undefined" ? globalThis.BAKED_LOGIN_HTML : "";
+  const err = error
+    ? '<div class="banner err" id="loginError">账号或密码不对</div>'
+    : "";
+  if (baked) return String(baked).replace("<!--ERROR-->", err);
+  return (
+    "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\" /><title>追觅客户监控</title></head>" +
+    "<body><h1>追觅客户监控</h1>" +
+    err +
+    "<form method=\"post\" action=\"/login\">" +
+    "<label for=\"username\">用户名</label>" +
+    "<input type=\"text\" name=\"username\" id=\"username\" autocomplete=\"username\" required />" +
+    "<label for=\"password\">密码</label>" +
+    "<input type=\"password\" name=\"password\" id=\"password\" autocomplete=\"current-password\" required />" +
+    "<button type=\"submit\">登录</button></form></body></html>"
+  );
+}
+
+function renderAppPage() {
+  const baked = typeof globalThis !== "undefined" ? globalThis.BAKED_APP_HTML : "";
+  return baked || "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\" /><title>追觅客户监控</title></head><body>追觅客户监控</body></html>";
+}
+
+async function readLoginForm(request) {
+  const ctype = request.headers.get("Content-Type") || "";
+  if (ctype.includes("multipart/form-data") && request.formData) {
+    const fd = await request.formData();
+    return {
+      username: String(fd.get("username") || ""),
+      password: String(fd.get("password") || ""),
+    };
+  }
+  const text = await request.text();
+  const params = new URLSearchParams(text);
+  return {
+    username: String(params.get("username") || ""),
+    password: String(params.get("password") || ""),
+  };
 }
 
 function shanghaiParts(date) {
@@ -110,6 +243,205 @@ function moneyFromQuota(quota, quotaPerUnit, usdRate) {
   const usd = quotaPerUnit ? q / quotaPerUnit : 0;
   const cny = usd * usdRate;
   return { quota: q, usd: roundN(usd, 6), cny: roundN(cny, 4) };
+}
+
+function isRefresh(url) {
+  const refreshRaw = (url.searchParams.get("refresh") || "0").toLowerCase();
+  return refreshRaw === "1" || refreshRaw === "true" || refreshRaw === "yes";
+}
+
+function aipddBaseOf(runtime) {
+  const raw =
+    envOf(runtime, "AIPDD_BASE_URL", "") || envOf(runtime, "AIPDD_BASE", AIPDD_DEFAULT_BASE) || AIPDD_DEFAULT_BASE;
+  const cleaned = String(raw).replace(/\/+$/, "");
+  if (/newapi\.aipdd\.work/i.test(cleaned) || /susciyuan\.com/i.test(cleaned)) {
+    return AIPDD_DEFAULT_BASE;
+  }
+  return cleaned || AIPDD_DEFAULT_BASE;
+}
+
+function asFiniteNumber(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() && !Number.isNaN(Number(v))) return Number(v);
+  return null;
+}
+
+function looksLikeRatePayload(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  const keys = Object.keys(obj);
+  return keys.includes("rmb") && keys.includes("usd") && !keys.some((k) => /awcoin|balance|wallet|credit/i.test(k));
+}
+
+function looksLikeNewApiQuota(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  const hasQuota = obj.quota != null && obj.used_quota != null;
+  const hasAwcoin = obj.awcoin != null || obj.awCoin != null || obj.aw_coin != null;
+  return hasQuota && !hasAwcoin;
+}
+
+function pickAwcoinFromObject(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  if (looksLikeRatePayload(obj) || looksLikeNewApiQuota(obj)) return null;
+  const preferred = [
+    "awcoin",
+    "awCoin",
+    "AWCoin",
+    "aw_coin",
+    "awcoin_balance",
+    "wallet_balance",
+    "available_balance",
+    "availableBalance",
+    "remain_awcoin",
+    "balance",
+    "wallet",
+    "credit",
+    "available",
+    "remain",
+    "remaining",
+    "amount",
+  ];
+  for (const key of preferred) {
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+    const n = asFiniteNumber(obj[key]);
+    if (n != null) return n;
+  }
+  return null;
+}
+
+function extractAwcoin(payload) {
+  if (payload == null) return null;
+  const direct = asFiniteNumber(payload);
+  if (direct != null) return direct;
+  if (typeof payload !== "object") return null;
+  if (payload.code != null && Number(payload.code) !== 0) return null;
+  if (payload.success === false) return null;
+  const data = payload.data;
+  if (asFiniteNumber(data) != null) return asFiniteNumber(data);
+  const fromData = pickAwcoinFromObject(data);
+  if (fromData != null) return fromData;
+  if (data && typeof data === "object") {
+    const nestedWallet = pickAwcoinFromObject(data.wallet) || pickAwcoinFromObject(data.account) || pickAwcoinFromObject(data.user);
+    if (nestedWallet != null) return nestedWallet;
+  }
+  return pickAwcoinFromObject(payload);
+}
+
+function extractAwcoinRate(payload) {
+  const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+  const rmb = asFiniteNumber(data && data.rmb);
+  const usd = asFiniteNumber(data && data.usd);
+  return {
+    rmb: rmb != null && rmb > 0 ? rmb : DEFAULT_AWCOIN_RMB,
+    usd: usd != null && usd > 0 ? usd : null,
+  };
+}
+
+function parseVolcBalance(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const meta = payload.ResponseMetadata;
+  if (meta && meta.Error) return null;
+  const result = payload.Result && typeof payload.Result === "object" ? payload.Result : payload;
+  const raw = result.AvailableBalance != null ? result.AvailableBalance : result.CashBalance;
+  return asFiniteNumber(raw);
+}
+
+function hexFromBuf(buf) {
+  return Array.from(new Uint8Array(buf), function (b) {
+    return b.toString(16).padStart(2, "0");
+  }).join("");
+}
+
+function volcXDate(date) {
+  const d = date || new Date();
+  return d.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+}
+
+function uriEncodeRfc3986(s) {
+  return encodeURIComponent(String(s)).replace(/[!'()*]/g, function (c) {
+    return "%" + c.charCodeAt(0).toString(16).toUpperCase();
+  });
+}
+
+function normQuery(params) {
+  return Object.keys(params)
+    .sort()
+    .map(function (k) {
+      return uriEncodeRfc3986(k) + "=" + uriEncodeRfc3986(params[k]);
+    })
+    .join("&");
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return hexFromBuf(digest);
+}
+
+async function hmacSha256Raw(keyBytes, text) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(text));
+  return new Uint8Array(sig);
+}
+
+async function signVolcengineV4(opts) {
+  const method = (opts.method || "GET").toUpperCase();
+  const path = opts.path || "/";
+  const host = opts.host;
+  const service = opts.service;
+  const region = opts.region || VOLC_BILLING_REGION;
+  const query = opts.query || {};
+  const body = opts.body || "";
+  const contentType = opts.contentType || VOLC_CONTENT_TYPE;
+  const xDate = opts.xDate;
+  const shortDate = xDate.slice(0, 8);
+  const xContentSha256 = await sha256Hex(body);
+  const signedHeaders = "content-type;host;x-content-sha256;x-date";
+  const canonicalHeaders =
+    "content-type:" +
+    contentType +
+    "\n" +
+    "host:" +
+    host +
+    "\n" +
+    "x-content-sha256:" +
+    xContentSha256 +
+    "\n" +
+    "x-date:" +
+    xDate +
+    "\n";
+  const canonicalRequest = [method, path, normQuery(query), canonicalHeaders, signedHeaders, xContentSha256].join("\n");
+  const hashedCanon = await sha256Hex(canonicalRequest);
+  const credentialScope = shortDate + "/" + region + "/" + service + "/request";
+  const stringToSign = ["HMAC-SHA256", xDate, credentialScope, hashedCanon].join("\n");
+  const enc = new TextEncoder();
+  const kDate = await hmacSha256Raw(enc.encode(opts.sk), shortDate);
+  const kRegion = await hmacSha256Raw(kDate, region);
+  const kService = await hmacSha256Raw(kRegion, service);
+  const kSigning = await hmacSha256Raw(kService, "request");
+  const signature = hexFromBuf(await hmacSha256Raw(kSigning, stringToSign));
+  return {
+    authorization:
+      "HMAC-SHA256 Credential=" +
+      opts.ak +
+      "/" +
+      credentialScope +
+      ", SignedHeaders=" +
+      signedHeaders +
+      ", Signature=" +
+      signature,
+    xDate: xDate,
+    xContentSha256: xContentSha256,
+    contentType: contentType,
+    host: host,
+    signature: signature,
+    credentialScope: credentialScope,
+    canonicalRequest: canonicalRequest,
+  };
 }
 
 function parseOther(raw) {
@@ -343,8 +675,7 @@ async function handleOverview(request, runtime) {
     return json(500, { ok: false, error: "missing SUSCIYUAN_ACCESS_TOKEN" });
   }
   const url = new URL(request.url);
-  const refreshRaw = (url.searchParams.get("refresh") || "0").toLowerCase();
-  const refresh = refreshRaw === "1" || refreshRaw === "true" || refreshRaw === "yes";
+  const refresh = isRefresh(url);
   const now = Date.now();
   let status = cache.status;
   let rawLogs = cache.logs;
@@ -362,14 +693,271 @@ async function handleOverview(request, runtime) {
   return json(200, buildOverview(status, rawLogs, cached));
 }
 
+function emptyAipdd(error) {
+  return { configured: false, cny: null, usd: null, awcoin: null, error: error || null };
+}
+
+function emptyVolces(error) {
+  return { configured: false, cny: null, usd: null, error: error || null };
+}
+
+function resetBalancesState() {
+  balancesCache = { ts: 0, payload: null };
+  aipddWalletPath = "";
+  aipddFailedPaths = [];
+  awcoinRateCache = { ts: 0, rmb: DEFAULT_AWCOIN_RMB, usd: 0.00001484 };
+}
+
+function assertAipddHost(url) {
+  const host = String(url).toLowerCase();
+  if (host.includes("newapi.aipdd.work") || host.includes("susciyuan.com") || host.includes("ark.cn-beijing.volces.com")) {
+    const err = new Error("blocked host");
+    err.status = 500;
+    throw err;
+  }
+}
+
+async function aipddGetJson(base, key, path) {
+  const root = base.endsWith("/") ? base : base + "/";
+  const url = new URL(path, root);
+  assertAipddHost(url.hostname);
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    redirect: "manual",
+    headers: {
+      "X-API-Key": key,
+      Authorization: "Bearer " + key,
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok || (res.status >= 300 && res.status < 400)) {
+    const err = new Error("upstream HTTP " + res.status);
+    err.status = 502;
+    throw err;
+  }
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const err = new Error("upstream invalid JSON");
+    err.status = 502;
+    throw err;
+  }
+}
+
+async function fetchAwcoinRate(base) {
+  const now = Date.now();
+  if (awcoinRateCache.ts && now - awcoinRateCache.ts < RATE_CACHE_TTL_MS) {
+    return { rmb: awcoinRateCache.rmb, usd: awcoinRateCache.usd, cached: true };
+  }
+  const root = base.endsWith("/") ? base : base + "/";
+  const url = new URL(AIPDD_RATE_PATH, root);
+  assertAipddHost(url.hostname);
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    redirect: "manual",
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    return { rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: false };
+  }
+  const payload = JSON.parse(await res.text());
+  const rate = extractAwcoinRate(payload);
+  awcoinRateCache = { ts: Date.now(), rmb: rate.rmb, usd: rate.usd };
+  return { rmb: rate.rmb, usd: rate.usd, cached: false };
+}
+
+async function probeAipddWallet(base, key, budget) {
+  const tried = [];
+  const paths = [];
+  if (aipddWalletPath && aipddFailedPaths.indexOf(aipddWalletPath) < 0) paths.push(aipddWalletPath);
+  for (let i = 0; i < AIPDD_WALLET_PATHS.length; i++) {
+    const p = AIPDD_WALLET_PATHS[i];
+    if (paths.indexOf(p) < 0 && aipddFailedPaths.indexOf(p) < 0) paths.push(p);
+  }
+  if (!paths.length) {
+    aipddFailedPaths = [];
+    paths.push.apply(paths, AIPDD_WALLET_PATHS);
+  }
+  const limit = Math.max(1, Math.min(budget, paths.length));
+  for (let i = 0; i < limit; i++) {
+    const path = paths[i];
+    tried.push(path);
+    try {
+      const payload = await aipddGetJson(base, key, path);
+      const awcoin = extractAwcoin(payload);
+      if (awcoin != null) {
+        aipddWalletPath = path;
+        return { awcoin: awcoin, path: path, tried: tried };
+      }
+    } catch {
+      // try next documented path; never surface upstream text
+    }
+    if (aipddFailedPaths.indexOf(path) < 0) aipddFailedPaths.push(path);
+  }
+  return { awcoin: null, path: "", tried: tried };
+}
+
+async function fetchVolcBalance(ak, sk, now) {
+  const query = { Action: "QueryBalanceAcct", Version: "2022-01-01" };
+  const signed = await signVolcengineV4({
+    method: "GET",
+    path: "/",
+    host: VOLC_BILLING_HOST,
+    service: VOLC_BILLING_SERVICE,
+    region: VOLC_BILLING_REGION,
+    query: query,
+    body: "",
+    contentType: VOLC_CONTENT_TYPE,
+    ak: ak,
+    sk: sk,
+    xDate: volcXDate(now),
+  });
+  const url = "https://" + VOLC_BILLING_HOST + "/?" + normQuery(query);
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "manual",
+    headers: {
+      Host: signed.host,
+      "Content-Type": signed.contentType,
+      "X-Date": signed.xDate,
+      "X-Content-Sha256": signed.xContentSha256,
+      Authorization: signed.authorization,
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok || (res.status >= 300 && res.status < 400)) {
+    const err = new Error("upstream HTTP " + res.status);
+    err.status = 502;
+    throw err;
+  }
+  const payload = JSON.parse(await res.text());
+  const cny = parseVolcBalance(payload);
+  if (cny == null) {
+    const err = new Error("volc balance missing");
+    err.status = 502;
+    throw err;
+  }
+  return cny;
+}
+
+async function handleBalances(request, runtime) {
+  const base = aipddBaseOf(runtime).replace(/\/+$/, "") || AIPDD_DEFAULT_BASE;
+  const aipddKey = envOf(runtime, "AIPDD_API_KEY", "");
+  const volcAk = envOf(runtime, "VOLC_ACCESS_KEY_ID", "");
+  const volcSk = envOf(runtime, "VOLC_SECRET_ACCESS_KEY", "");
+  const generatedAt = formatFull(new Date());
+
+  const aipddReady = Boolean(aipddKey);
+  const volcReady = Boolean(volcAk && volcSk);
+  if (!aipddReady && !volcReady) {
+    const volcMissing = [];
+    if (!volcAk) volcMissing.push("VOLC_ACCESS_KEY_ID");
+    if (!volcSk) volcMissing.push("VOLC_SECRET_ACCESS_KEY");
+    return json(200, {
+      ok: true,
+      aipdd: emptyAipdd("未配置 AIPDD_API_KEY"),
+      volces: emptyVolces("未配置 " + volcMissing.join(" / ")),
+      generated_at: generatedAt,
+      cached: false,
+    });
+  }
+
+  const url = new URL(request.url);
+  const refresh = isRefresh(url);
+  const now = Date.now();
+  if (!refresh && balancesCache.payload && now - balancesCache.ts < CACHE_TTL_MS) {
+    return json(200, Object.assign({}, balancesCache.payload, { cached: true }));
+  }
+
+  let used = 0;
+  let rateP = Promise.resolve({ rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: true });
+  let aipddP = Promise.resolve(null);
+  let volcP = Promise.resolve(null);
+
+  if (volcReady) {
+    used += 1;
+    volcP = fetchVolcBalance(volcAk, volcSk, new Date()).then(
+      function (cny) {
+        return { ok: true, cny: cny };
+      },
+      function () {
+        return { ok: false };
+      }
+    );
+  }
+
+  if (aipddReady) {
+    const rateFresh = awcoinRateCache.ts && now - awcoinRateCache.ts < RATE_CACHE_TTL_MS;
+    if (!rateFresh && used < MAX_BALANCES_SUBREQ) {
+      used += 1;
+      rateP = fetchAwcoinRate(base).catch(function () {
+        return { rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: false };
+      });
+    }
+    const walletBudget = Math.max(1, MAX_BALANCES_SUBREQ - used);
+    aipddP = probeAipddWallet(base, aipddKey, walletBudget);
+  }
+
+  const settled = await Promise.all([rateP, aipddP, volcP]);
+  const rate = settled[0] || { rmb: DEFAULT_AWCOIN_RMB, usd: null };
+  const wallet = settled[1];
+  const volcRes = settled[2];
+
+  let aipdd;
+  if (!aipddReady) {
+    aipdd = emptyAipdd("未配置 AIPDD_API_KEY");
+  } else if (!wallet || wallet.awcoin == null) {
+    aipdd = { configured: true, cny: null, usd: null, awcoin: null, error: "AIPDD 余额查询失败" };
+  } else {
+    const rmb = rate.rmb > 0 ? rate.rmb : DEFAULT_AWCOIN_RMB;
+    const cny = roundN(wallet.awcoin * rmb, 4);
+    const usd = rate.usd != null ? roundN(wallet.awcoin * rate.usd, 6) : null;
+    aipdd = { configured: true, cny: cny, usd: usd, awcoin: wallet.awcoin, error: null };
+  }
+
+  let volces;
+  if (!volcAk || !volcSk) {
+    const missing = [];
+    if (!volcAk) missing.push("VOLC_ACCESS_KEY_ID");
+    if (!volcSk) missing.push("VOLC_SECRET_ACCESS_KEY");
+    volces = emptyVolces("未配置 " + missing.join(" / "));
+  } else if (!volcRes || !volcRes.ok) {
+    volces = { configured: true, cny: null, usd: null, error: "火山引擎余额查询失败" };
+  } else {
+    volces = { configured: true, cny: roundN(volcRes.cny, 4), usd: null, error: null, currency: "CNY" };
+  }
+
+  const payload = {
+    ok: true,
+    aipdd: aipdd,
+    volces: volces,
+    generated_at: formatFull(new Date()),
+    cached: false,
+  };
+  balancesCache = { ts: Date.now(), payload: payload };
+  return json(200, payload);
+}
+
+export {
+  extractAwcoin,
+  extractAwcoinRate,
+  parseVolcBalance,
+  signVolcengineV4,
+  volcXDate,
+  normQuery,
+  resetBalancesState,
+  makeSessionToken,
+  verifySessionToken,
+  renderLoginPage,
+  SESSION_COOKIE,
+};
+
 export default {
   async fetch(request, env) {
     const runtime = env || {};
     const password = envOf(runtime, "DASHBOARD_PASSWORD", "");
-    if (password) {
-      const user = envOf(runtime, "DASHBOARD_USER", "zhuimi") || "zhuimi";
-      if (!checkBasic(request, user, password)) return unauthorized();
-    }
+    const user = envOf(runtime, "DASHBOARD_USER", "zhuimi") || "zhuimi";
     let url;
     try {
       url = new URL(request.url);
@@ -377,15 +965,74 @@ export default {
       return json(400, { ok: false, error: "bad url" });
     }
     const path = url.pathname;
+
     try {
-      if (request.method !== "GET") {
-        return json(405, { ok: false, error: "method not allowed" });
+      if (path === "/login" && request.method === "POST") {
+        if (!password) {
+          return new Response(null, { status: 302, headers: { Location: "/", "Cache-Control": "no-store" } });
+        }
+        const form = await readLoginForm(request);
+        const ok = safeEqual(form.username, user) && safeEqual(form.password, password);
+        if (!ok) {
+          return htmlPage(200, renderLoginPage(true));
+        }
+        const token = await makeSessionToken(user, password, Date.now());
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: "/",
+            "Set-Cookie": sessionCookieValue(token, request.url, false),
+            "Cache-Control": "no-store",
+          },
+        });
       }
+
+      if ((path === "/logout" || path === "/logout/") && (request.method === "GET" || request.method === "POST")) {
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: "/",
+            "Set-Cookie": sessionCookieValue("", request.url, true),
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+
+      if (path === "/login" && request.method === "GET") {
+        return htmlPage(200, renderLoginPage(false));
+      }
+
+      const authed =
+        !password || (await verifySessionToken(cookieHeader(request, SESSION_COOKIE), user, password, Date.now()));
+
+      if (path === "/api/session") {
+        if (!authed) return jsonUnauthorized();
+        return json(200, { ok: true });
+      }
+
       if (path === "/api/health") {
         return json(200, { ok: true });
       }
+
+      if (password && !authed) {
+        if (path.startsWith("/api/")) return jsonUnauthorized();
+        if (request.method === "GET" && (path === "/" || path === "/index.html" || path === "/app.html")) {
+          return htmlPage(200, renderLoginPage(false));
+        }
+      }
+
+      if (request.method === "GET" && (path === "/" || path === "/index.html" || path === "/app.html")) {
+        return htmlPage(200, renderAppPage());
+      }
+
+      if (request.method !== "GET") {
+        return json(405, { ok: false, error: "method not allowed" });
+      }
       if (path === "/api/overview") {
         return await handleOverview(request, runtime);
+      }
+      if (path === "/api/balances") {
+        return await handleBalances(request, runtime);
       }
       return json(404, { ok: false, error: "not found" });
     } catch (err) {

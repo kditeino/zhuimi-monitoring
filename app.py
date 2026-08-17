@@ -17,7 +17,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import base64
+import hashlib
 import hmac
+
+
+SESSION_COOKIE = "zm_sid"
+SESSION_DAYS = 7
+SESSION_PEPPER = "zhuimi-monitor-session-v1"
 
 
 def _dashboard_creds(env: dict[str, str]) -> tuple[str, str] | None:
@@ -28,38 +34,88 @@ def _dashboard_creds(env: dict[str, str]) -> tuple[str, str] | None:
     return (user or "zhuimi", pw)
 
 
-def _check_basic_auth(handler: "Handler", env: dict[str, str]) -> bool:
+def _session_key(password: str) -> bytes:
+    return hashlib.sha256((password + SESSION_PEPPER).encode("utf-8")).digest()
+
+
+def _make_session_token(user: str, password: str) -> str:
+    exp = int(time.time()) + SESSION_DAYS * 86400
+    payload = f"v1|{user}|{exp}"
+    raw = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+    sig = hmac.new(_session_key(password), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}"
+
+
+def _verify_session_token(token: str, user: str, password: str) -> bool:
+    parts = (token or "").split(".")
+    if len(parts) != 2:
+        return False
+    raw, got_sig = parts
+    pad = "=" * (-len(raw) % 4)
+    try:
+        payload = base64.urlsafe_b64decode(raw + pad).decode("utf-8")
+    except Exception:
+        return False
+    expect = hmac.new(_session_key(password), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expect, got_sig):
+        return False
+    bits = payload.split("|")
+    if len(bits) != 3 or bits[0] != "v1" or not hmac.compare_digest(bits[1], user):
+        return False
+    try:
+        exp = int(bits[2])
+    except ValueError:
+        return False
+    return exp > int(time.time())
+
+
+def _cookie_from_headers(handler: "Handler", name: str) -> str:
+    raw = handler.headers.get("Cookie") or ""
+    for part in raw.split(";"):
+        piece = part.strip()
+        if "=" not in piece:
+            continue
+        k, v = piece.split("=", 1)
+        if k == name:
+            return v
+    return ""
+
+
+def _session_cookie(token: str, secure: bool, clear: bool = False) -> str:
+    flags = "Path=/; HttpOnly; SameSite=Lax"
+    if secure:
+        flags += "; Secure"
+    if clear:
+        return f"{SESSION_COOKIE}=; {flags}; Max-Age=0"
+    return f"{SESSION_COOKIE}={token}; {flags}; Max-Age={SESSION_DAYS * 86400}"
+
+
+def _is_authed(handler: "Handler", env: dict[str, str]) -> bool:
     creds = _dashboard_creds(env)
     if creds is None:
         return True
     user, pw = creds
-    header = handler.headers.get("Authorization") or ""
-    if not header.startswith("Basic "):
-        return False
-    try:
-        raw = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
-        got_user, got_pw = raw.split(":", 1)
-    except Exception:
-        return False
-    return hmac.compare_digest(got_user, user) and hmac.compare_digest(got_pw, pw)
+    return _verify_session_token(_cookie_from_headers(handler, SESSION_COOKIE), user, pw)
 
 
-def _require_auth(handler: "Handler", env: dict[str, str]) -> bool:
-    if _check_basic_auth(handler, env):
-        return True
-    body = b"Unauthorized"
+def _json_unauthorized(handler: "Handler") -> None:
+    body = json.dumps({"ok": False, "error": "unauthorized"}, ensure_ascii=False).encode("utf-8")
     handler.send_response(401)
-    handler.send_header("WWW-Authenticate", 'Basic realm="Zhuimi Monitor"')
-    handler.send_header("Content-Type", "text/plain; charset=utf-8")
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
     handler.wfile.write(body)
-    return False
 
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+
+
+def _login_html(error: bool = False) -> bytes:
+    html = (STATIC_DIR / "login.html").read_text(encoding="utf-8")
+    err = '<div class="banner err" id="loginError">账号或密码不对</div>' if error else ""
+    return html.replace("<!--ERROR-->", err).encode("utf-8")
 FILTER_PATH = APP_DIR / "client_filter.json"
 ENV_PATH = Path(
     os.environ.get(
@@ -87,6 +143,7 @@ TYPE_LABELS = {
 
 _cache_lock = threading.Lock()
 _cache: dict[str, Any] = {"ts": 0.0, "status": None, "logs": None}
+_balances_cache: dict[str, Any] = {"ts": 0.0, "payload": None}
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -463,6 +520,302 @@ def build_report(env: dict[str, str], hours: int | None = None, period: str | No
     }
 
 
+AIPDD_DEFAULT_BASE = "https://api.aipdd.work"
+AIPDD_WALLET_PATHS = ["/v1/user", "/v1/wallet", "/v1/account", "/v1/balance", "/api/user/self"]
+DEFAULT_AWCOIN_RMB = 0.0001
+VOLC_BILLING_HOST = "billing.volcengineapi.com"
+VOLC_BILLING_SERVICE = "billing"
+VOLC_BILLING_REGION = "cn-north-1"
+VOLC_CONTENT_TYPE = "application/x-www-form-urlencoded"
+
+
+def _empty_aipdd(error: str | None) -> dict[str, Any]:
+    return {"configured": False, "cny": None, "usd": None, "awcoin": None, "error": error}
+
+
+def _empty_volces(error: str | None) -> dict[str, Any]:
+    return {"configured": False, "cny": None, "usd": None, "error": error}
+
+
+def _aipdd_base(env: dict[str, str]) -> str:
+    raw = (env.get("AIPDD_BASE_URL") or env.get("AIPDD_BASE") or AIPDD_DEFAULT_BASE).strip().rstrip("/")
+    if "newapi.aipdd.work" in raw.lower() or "susciyuan.com" in raw.lower():
+        return AIPDD_DEFAULT_BASE
+    return raw or AIPDD_DEFAULT_BASE
+
+
+def _as_finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _looks_like_rate(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    keys = set(obj)
+    return "rmb" in keys and "usd" in keys and not any(
+        any(token in k.lower() for token in ("awcoin", "balance", "wallet", "credit")) for k in keys
+    )
+
+
+def _looks_like_newapi_quota(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    has_quota = obj.get("quota") is not None and obj.get("used_quota") is not None
+    has_awcoin = obj.get("awcoin") is not None or obj.get("awCoin") is not None or obj.get("aw_coin") is not None
+    return has_quota and not has_awcoin
+
+
+def _pick_awcoin(obj: Any) -> float | None:
+    if not isinstance(obj, dict) or _looks_like_rate(obj) or _looks_like_newapi_quota(obj):
+        return None
+    for key in (
+        "awcoin",
+        "awCoin",
+        "AWCoin",
+        "aw_coin",
+        "awcoin_balance",
+        "wallet_balance",
+        "available_balance",
+        "availableBalance",
+        "remain_awcoin",
+        "balance",
+        "wallet",
+        "credit",
+        "available",
+        "remain",
+        "remaining",
+        "amount",
+    ):
+        if key in obj:
+            n = _as_finite_number(obj.get(key))
+            if n is not None:
+                return n
+    return None
+
+
+def _extract_awcoin(payload: Any) -> float | None:
+    direct = _as_finite_number(payload)
+    if direct is not None:
+        return direct
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("code") is not None and int(payload.get("code") or 0) != 0:
+        return None
+    if payload.get("success") is False:
+        return None
+    data = payload.get("data")
+    n = _as_finite_number(data)
+    if n is not None:
+        return n
+    found = _pick_awcoin(data)
+    if found is not None:
+        return found
+    if isinstance(data, dict):
+        for nested in (data.get("wallet"), data.get("account"), data.get("user")):
+            found = _pick_awcoin(nested)
+            if found is not None:
+                return found
+    return _pick_awcoin(payload)
+
+
+def _aipdd_get(base: str, key: str, path: str) -> dict[str, Any]:
+    host = urllib.parse.urlparse(base).hostname or ""
+    if "newapi.aipdd.work" in host or "susciyuan.com" in host:
+        raise RuntimeError("blocked host")
+    url = f"{base.rstrip('/')}{path}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "X-API-Key": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _volc_norm_query(params: dict[str, str]) -> str:
+    parts = []
+    for key in sorted(params):
+        parts.append(
+            f"{urllib.parse.quote(key, safe='-_.~')}={urllib.parse.quote(str(params[key]), safe='-_.~')}"
+        )
+    return "&".join(parts).replace("+", "%20")
+
+
+def _volc_sign(ak: str, sk: str, x_date: str) -> dict[str, str]:
+    query = {"Action": "QueryBalanceAcct", "Version": "2022-01-01"}
+    body = ""
+    x_content = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    signed_headers = "content-type;host;x-content-sha256;x-date"
+    canonical = "\n".join(
+        [
+            "GET",
+            "/",
+            _volc_norm_query(query),
+            "\n".join(
+                [
+                    f"content-type:{VOLC_CONTENT_TYPE}",
+                    f"host:{VOLC_BILLING_HOST}",
+                    f"x-content-sha256:{x_content}",
+                    f"x-date:{x_date}",
+                ]
+            ),
+            "",
+            signed_headers,
+            x_content,
+        ]
+    )
+    hashed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    short = x_date[:8]
+    scope = f"{short}/{VOLC_BILLING_REGION}/{VOLC_BILLING_SERVICE}/request"
+    string_to_sign = "\n".join(["HMAC-SHA256", x_date, scope, hashed])
+    k_date = hmac.new(sk.encode("utf-8"), short.encode("utf-8"), hashlib.sha256).digest()
+    k_region = hmac.new(k_date, VOLC_BILLING_REGION.encode("utf-8"), hashlib.sha256).digest()
+    k_service = hmac.new(k_region, VOLC_BILLING_SERVICE.encode("utf-8"), hashlib.sha256).digest()
+    k_signing = hmac.new(k_service, b"request", hashlib.sha256).digest()
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "query": _volc_norm_query(query),
+        "authorization": (
+            f"HMAC-SHA256 Credential={ak}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+        "x_date": x_date,
+        "x_content": x_content,
+    }
+
+
+def _fetch_volc_balance(ak: str, sk: str) -> float:
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    signed = _volc_sign(ak, sk, now)
+    url = f"https://{VOLC_BILLING_HOST}/?{signed['query']}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Host": VOLC_BILLING_HOST,
+            "Content-Type": VOLC_CONTENT_TYPE,
+            "X-Date": signed["x_date"],
+            "X-Content-Sha256": signed["x_content"],
+            "Authorization": signed["authorization"],
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        payload = json.loads(resp.read().decode())
+    meta = payload.get("ResponseMetadata") or {}
+    if meta.get("Error"):
+        raise RuntimeError("volc error")
+    result = payload.get("Result") if isinstance(payload.get("Result"), dict) else payload
+    raw = result.get("AvailableBalance")
+    if raw is None:
+        raw = result.get("CashBalance")
+    n = _as_finite_number(raw)
+    if n is None:
+        raise RuntimeError("volc balance missing")
+    return n
+
+
+def build_balances(env: dict[str, str], force: bool = False) -> dict[str, Any]:
+    """Official AIPDD AWCoin + Volcengine billing balances. Missing keys stay unconfigured."""
+    generated_at = datetime.now(TZ_SH).strftime("%Y-%m-%d %H:%M:%S")
+    base = _aipdd_base(env)
+    aipdd_key = (env.get("AIPDD_API_KEY") or "").strip()
+    volc_ak = (env.get("VOLC_ACCESS_KEY_ID") or "").strip()
+    volc_sk = (env.get("VOLC_SECRET_ACCESS_KEY") or "").strip()
+
+    if not aipdd_key and not (volc_ak and volc_sk):
+        missing = [k for k, v in (("VOLC_ACCESS_KEY_ID", volc_ak), ("VOLC_SECRET_ACCESS_KEY", volc_sk)) if not v]
+        return {
+            "ok": True,
+            "aipdd": _empty_aipdd("未配置 AIPDD_API_KEY"),
+            "volces": _empty_volces("未配置 " + " / ".join(missing)),
+            "generated_at": generated_at,
+            "cached": False,
+        }
+
+    with _cache_lock:
+        cached_payload = _balances_cache.get("payload")
+        cached_ts = float(_balances_cache.get("ts") or 0)
+    if not force and cached_payload is not None and (time.time() - cached_ts) < CACHE_TTL_SEC:
+        out = dict(cached_payload)
+        out["cached"] = True
+        return out
+
+    rmb = DEFAULT_AWCOIN_RMB
+    usd_rate = None
+    if aipdd_key:
+        try:
+            rate_payload = _aipdd_get(base, aipdd_key, "/system/awcoin-rate")
+            data = rate_payload.get("data") if isinstance(rate_payload.get("data"), dict) else {}
+            rmb = _as_finite_number(data.get("rmb")) or DEFAULT_AWCOIN_RMB
+            usd_rate = _as_finite_number(data.get("usd"))
+        except Exception:
+            rmb = DEFAULT_AWCOIN_RMB
+
+    if aipdd_key:
+        awcoin = None
+        for path in AIPDD_WALLET_PATHS:
+            try:
+                payload = _aipdd_get(base, aipdd_key, path)
+                awcoin = _extract_awcoin(payload)
+                if awcoin is not None:
+                    break
+            except Exception:
+                continue
+        if awcoin is None:
+            aipdd = {
+                "configured": True,
+                "cny": None,
+                "usd": None,
+                "awcoin": None,
+                "error": "AIPDD 余额查询失败",
+            }
+        else:
+            aipdd = {
+                "configured": True,
+                "cny": round(awcoin * rmb, 4),
+                "usd": round(awcoin * usd_rate, 6) if usd_rate else None,
+                "awcoin": awcoin,
+                "error": None,
+            }
+    else:
+        aipdd = _empty_aipdd("未配置 AIPDD_API_KEY")
+
+    if not volc_ak or not volc_sk:
+        missing = [k for k, v in (("VOLC_ACCESS_KEY_ID", volc_ak), ("VOLC_SECRET_ACCESS_KEY", volc_sk)) if not v]
+        volces: dict[str, Any] = _empty_volces("未配置 " + " / ".join(missing))
+    else:
+        try:
+            cny = _fetch_volc_balance(volc_ak, volc_sk)
+            volces = {"configured": True, "cny": round(cny, 4), "usd": None, "error": None, "currency": "CNY"}
+        except Exception:
+            volces = {"configured": True, "cny": None, "usd": None, "error": "火山引擎余额查询失败"}
+
+    payload = {
+        "ok": True,
+        "aipdd": aipdd,
+        "volces": volces,
+        "generated_at": datetime.now(TZ_SH).strftime("%Y-%m-%d %H:%M:%S"),
+        "cached": False,
+    }
+    with _cache_lock:
+        _balances_cache["ts"] = time.time()
+        _balances_cache["payload"] = payload
+    return payload
+
+
 class Handler(BaseHTTPRequestHandler):
     env: dict[str, str] = {}
 
@@ -483,16 +836,81 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self._send(code, body, "application/json; charset=utf-8")
 
+    def _redirect(self, location: str, cookie: str | None = None) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _secure_cookie(self) -> bool:
+        return (self.headers.get("X-Forwarded-Proto") or "").lower() == "https"
+
+    def do_POST(self) -> None:  # noqa: N802
+        env = load_env(ENV_PATH)
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/logout" or path == "/logout/":
+            self._redirect("/", _session_cookie("", self._secure_cookie(), clear=True))
+            return
+        if path != "/login":
+            self._json(405, {"ok": False, "error": "method not allowed"})
+            return
+        creds = _dashboard_creds(env)
+        if creds is None:
+            self._redirect("/")
+            return
+        user, pw = creds
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length) if length > 0 else b""
+        form = parse_qs(raw.decode("utf-8", errors="replace"))
+        got_user = (form.get("username") or [""])[0]
+        got_pw = (form.get("password") or [""])[0]
+        if (
+            len(got_user) == len(user)
+            and len(got_pw) == len(pw)
+            and hmac.compare_digest(got_user, user)
+            and hmac.compare_digest(got_pw, pw)
+        ):
+            token = _make_session_token(user, pw)
+            self._redirect("/", _session_cookie(token, self._secure_cookie()))
+            return
+        self._send(200, _login_html(True), "text/html; charset=utf-8")
+
     def do_GET(self) -> None:  # noqa: N802
         env = load_env(ENV_PATH)
-        if not _require_auth(self, env):
-            return
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        if path == "/logout" or path == "/logout/":
+            self._redirect("/", _session_cookie("", self._secure_cookie(), clear=True))
+            return
+        if path == "/login":
+            self._send(200, _login_html(False), "text/html; charset=utf-8")
+            return
+        if path == "/api/health":
+            self._json(200, {"ok": True, "ts": int(time.time())})
+            return
+        if path == "/api/session":
+            if not _is_authed(self, env):
+                _json_unauthorized(self)
+                return
+            self._json(200, {"ok": True})
+            return
+
+        authed = _is_authed(self, env)
+        if not authed:
+            if path.startswith("/api/"):
+                _json_unauthorized(self)
+                return
+            self._send(200, _login_html(False), "text/html; charset=utf-8")
+            return
+
         try:
-            if path == "/" or path == "/index.html":
+            if path == "/" or path == "/index.html" or path == "/app.html":
                 html = (STATIC_DIR / "index.html").read_bytes()
                 self._send(200, html, "text/html; charset=utf-8")
                 return
@@ -517,6 +935,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/overview":
                 force = qs.get("refresh", ["0"])[0] in ("1", "true", "yes")
                 self._json(200, build_overview(self.env, force=force))
+                return
+            if path == "/api/balances":
+                force = qs.get("refresh", ["0"])[0] in ("1", "true", "yes")
+                self._json(200, build_balances(env, force=force))
                 return
             if path == "/api/report":
                 hours = None

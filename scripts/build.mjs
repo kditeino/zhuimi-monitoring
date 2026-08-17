@@ -14,6 +14,11 @@ const BAKE_KEYS = [
   "SUSCIYUAN_USER_ID",
   "DASHBOARD_USER",
   "DASHBOARD_PASSWORD",
+  "AIPDD_BASE_URL",
+  "AIPDD_BASE",
+  "AIPDD_API_KEY",
+  "VOLC_ACCESS_KEY_ID",
+  "VOLC_SECRET_ACCESS_KEY",
 ];
 
 function bakedEnvLiteral() {
@@ -28,10 +33,20 @@ function bakedEnvLiteral() {
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 await cp(staticDir, dist, { recursive: true });
-console.log("copied static/ -> dist/");
+const loginHtml = await readFile(join(staticDir, "login.html"), "utf8");
+const appHtml = await readFile(join(staticDir, "index.html"), "utf8");
+await writeFile(join(dist, "index.html"), loginHtml, "utf8");
+await writeFile(join(dist, "app.html"), appHtml, "utf8");
+console.log("copied static/ -> dist/ (index.html is login, app.html is dashboard)");
 
 const src = await readFile(srcWorker, "utf8");
 await rm(distWorker, { recursive: true, force: true });
 await mkdir(distWorker, { recursive: true });
-await writeFile(join(distWorker, "index.js"), bakedEnvLiteral() + src, "utf8");
-console.log("wrote dist-worker/index.js (baked env keys only; values not printed)");
+const bakedHtml =
+  "globalThis.BAKED_LOGIN_HTML = " +
+  JSON.stringify(loginHtml) +
+  ";\nglobalThis.BAKED_APP_HTML = " +
+  JSON.stringify(appHtml) +
+  ";\n";
+await writeFile(join(distWorker, "index.js"), bakedEnvLiteral() + bakedHtml + src, "utf8");
+console.log("wrote dist-worker/index.js (baked env keys and HTML; values not printed)");

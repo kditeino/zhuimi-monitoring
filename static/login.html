@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>追觅客户监控</title>
+  <script>
+    (function () {
+      var theme = "dark";
+      try {
+        var saved = localStorage.getItem("zhuimi-theme");
+        if (saved === "light" || saved === "dark") {
+          theme = saved;
+        } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+          theme = "light";
+        }
+      } catch (e) {}
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090b0f;
+      --bg-elev: #11141a;
+      --bg-card: #161a22;
+      --line: #262b36;
+      --line-strong: #343b4a;
+      --text: #e8ebf0;
+      --muted: #7d8594;
+      --error: #e25b6a;
+      --error-dim: rgba(226, 91, 106, .12);
+      --steel: #8ea0b8;
+      --steel-dim: rgba(142, 160, 184, .14);
+      --radius: 12px;
+      --banner-err-fg: #f3b4ba;
+      --badge-error-bd: rgba(226,91,106,.35);
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --bg-elev: #ffffff;
+      --bg-card: #ffffff;
+      --line: #d7dde7;
+      --line-strong: #c2cad6;
+      --text: #1a2030;
+      --muted: #667085;
+      --error: #c43d4d;
+      --error-dim: rgba(196, 61, 77, .10);
+      --steel: #4f6480;
+      --steel-dim: rgba(79, 100, 128, .12);
+      --banner-err-fg: #9a2433;
+      --badge-error-bd: rgba(196,61,77,.30);
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "SF Pro Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    body { min-height: 100vh; }
+    .wrap {
+      max-width: 420px;
+      margin: 0 auto;
+      padding: 48px 14px 36px;
+      padding-left: max(14px, env(safe-area-inset-left));
+      padding-right: max(14px, env(safe-area-inset-right));
+    }
+    .eyebrow {
+      font-size: 11px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.28rem;
+      font-weight: 650;
+    }
+    .lead { color: var(--muted); font-size: 13px; margin: 0 0 18px; }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 18px 16px 16px;
+    }
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin: 0 0 6px;
+    }
+    label + label { margin-top: 12px; }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      appearance: none;
+      border: 1px solid var(--line-strong);
+      background: var(--bg-elev);
+      color: var(--text);
+      border-radius: 9px;
+      padding: 10px 12px;
+      font-size: 14px;
+      font-family: inherit;
+    }
+    input:focus {
+      outline: 2px solid var(--steel);
+      outline-offset: 1px;
+    }
+    .btn {
+      appearance: none;
+      width: 100%;
+      margin-top: 16px;
+      border: 1px solid var(--line-strong);
+      background: var(--steel-dim);
+      color: var(--text);
+      border-radius: 9px;
+      padding: 10px 12px;
+      font-size: 14px;
+      font-weight: 620;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .btn:hover { border-color: var(--steel); }
+    .banner {
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+    .banner.err {
+      background: var(--error-dim);
+      color: var(--banner-err-fg);
+      border: 1px solid var(--badge-error-bd);
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="eyebrow">Susciyuan · Internal</div>
+    <h1>追觅客户监控</h1>
+    <p class="lead">内部监控页，请使用看板账号登录。浏览器可以记住用户名和密码。</p>
+    <!--ERROR-->
+    <form class="card" method="post" action="/login">
+      <label for="username">用户名
+        <input type="text" name="username" id="username" autocomplete="username" required />
+      </label>
+      <label for="password">密码
+        <input type="password" name="password" id="password" autocomplete="current-password" required />
+      </label>
+      <button class="btn" type="submit">登录</button>
+    </form>
+  </div>
+  <script>
+    fetch("/api/session", { credentials: "same-origin", cache: "no-store" })
+      .then(function (res) { if (res.ok) location.replace("/app.html"); })
+      .catch(function () {});
+  </script>
+</body>
+</html>

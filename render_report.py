@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +19,7 @@ OUT = Path(os.environ.get(
 ))
 
 
-def _opener():
+def _dashboard_creds() -> tuple[str, str]:
     env_path = Path(os.environ.get(
         "SUSCIYUAN_ENV",
         str(Path(__file__).resolve().parent / ".env"),
@@ -29,11 +31,36 @@ def _opener():
                 user = line.split("=", 1)[1].strip() or user
             elif line.startswith("DASHBOARD_PASSWORD="):
                 pw = line.split("=", 1)[1].strip()
+    return user, pw
+
+
+class _CookieRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        cookie = headers.get("Set-Cookie")
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and cookie:
+            new.add_header("Cookie", cookie.split(";", 1)[0])
+        return new
+
+
+def _opener():
+    return urllib.request.build_opener(_CookieRedirect)
+
+
+def _session_cookie() -> str:
+    user, pw = _dashboard_creds()
     if not pw:
-        return urllib.request.build_opener()
-    mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-    mgr.add_password(None, BASE, user, pw)
-    return urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(mgr))
+        return ""
+    data = urllib.parse.urlencode({"username": user, "password": pw}).encode()
+    req = urllib.request.Request(f"{BASE}/login", data=data, method="POST")
+    try:
+        with _opener().open(req, timeout=30) as resp:
+            return (resp.headers.get("Set-Cookie") or "").split(";", 1)[0]
+    except urllib.error.HTTPError as e:
+        cookie = (e.headers.get("Set-Cookie") or "").split(";", 1)[0]
+        if cookie:
+            return cookie
+        raise
 
 
 def fetch_report(period: str | None, hours: int | None) -> dict:
@@ -41,7 +68,11 @@ def fetch_report(period: str | None, hours: int | None) -> dict:
         url = f"{BASE}/api/report?period={period}"
     else:
         url = f"{BASE}/api/report?hours={hours or 12}"
-    with _opener().open(url, timeout=60) as resp:
+    req = urllib.request.Request(url)
+    cookie = _session_cookie()
+    if cookie:
+        req.add_header("Cookie", cookie)
+    with _opener().open(req, timeout=60) as resp:
         return json.loads(resp.read().decode())
 
 
