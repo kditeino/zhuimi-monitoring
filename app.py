@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import base64
+import hashlib
 import hmac
 
 
@@ -464,70 +465,227 @@ def build_report(env: dict[str, str], hours: int | None = None, period: str | No
     }
 
 
+AIPDD_DEFAULT_BASE = "https://api.aipdd.work"
+AIPDD_WALLET_PATHS = ["/v1/user", "/v1/wallet", "/v1/account", "/v1/balance", "/api/user/self"]
+DEFAULT_AWCOIN_RMB = 0.0001
+VOLC_BILLING_HOST = "billing.volcengineapi.com"
+VOLC_BILLING_SERVICE = "billing"
+VOLC_BILLING_REGION = "cn-north-1"
+VOLC_CONTENT_TYPE = "application/x-www-form-urlencoded"
+
+
 def _empty_aipdd(error: str | None) -> dict[str, Any]:
-    return {"configured": False, "cny": None, "usd": None, "quota_remain": None, "error": error}
+    return {"configured": False, "cny": None, "usd": None, "awcoin": None, "error": error}
 
 
 def _empty_volces(error: str | None) -> dict[str, Any]:
     return {"configured": False, "cny": None, "usd": None, "error": error}
 
 
-def _parse_channel_balance(payload: Any) -> tuple[float | None, str | None]:
-    if isinstance(payload, (int, float)) and not isinstance(payload, bool):
-        return float(payload), None
-    if not isinstance(payload, dict):
-        return None, None
-    nested = payload.get("data") if isinstance(payload.get("data"), dict) else None
+def _aipdd_base(env: dict[str, str]) -> str:
+    raw = (env.get("AIPDD_BASE_URL") or env.get("AIPDD_BASE") or AIPDD_DEFAULT_BASE).strip().rstrip("/")
+    if "newapi.aipdd.work" in raw.lower() or "susciyuan.com" in raw.lower():
+        return AIPDD_DEFAULT_BASE
+    return raw or AIPDD_DEFAULT_BASE
 
-    def _currency(obj: Any) -> str | None:
-        if not isinstance(obj, dict):
-            return None
-        raw = str(obj.get("currency") or obj.get("Currency") or obj.get("quota_display_type") or "").strip().upper()
-        if raw in ("CNY", "RMB"):
-            return "CNY"
-        if raw == "USD":
-            return "USD"
+
+def _as_finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
         return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
-    currency = _currency(nested) or _currency(payload)
-    named = [
-        ("balance_cny", payload.get("balance_cny"), "CNY"),
-        ("balance_cny", (nested or {}).get("balance_cny"), "CNY"),
-        ("cny", payload.get("cny"), "CNY"),
-        ("cny", (nested or {}).get("cny"), "CNY"),
-        ("balance", payload.get("balance"), currency),
-        ("data", payload.get("data") if not isinstance(payload.get("data"), dict) else None, currency),
-        ("balance", (nested or {}).get("balance"), currency),
-        ("usd", (nested or {}).get("usd"), "USD"),
-        ("usd", payload.get("usd"), "USD"),
-    ]
-    for _name, cand, forced in named:
-        if isinstance(cand, bool):
-            continue
-        if isinstance(cand, (int, float)):
-            return float(cand), forced
-        if isinstance(cand, str) and cand.strip():
-            try:
-                return float(cand), forced
-            except ValueError:
-                continue
-    return None, None
+
+def _looks_like_rate(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    keys = set(obj)
+    return "rmb" in keys and "usd" in keys and not any(
+        any(token in k.lower() for token in ("awcoin", "balance", "wallet", "credit")) for k in keys
+    )
+
+
+def _looks_like_newapi_quota(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    has_quota = obj.get("quota") is not None and obj.get("used_quota") is not None
+    has_awcoin = obj.get("awcoin") is not None or obj.get("awCoin") is not None or obj.get("aw_coin") is not None
+    return has_quota and not has_awcoin
+
+
+def _pick_awcoin(obj: Any) -> float | None:
+    if not isinstance(obj, dict) or _looks_like_rate(obj) or _looks_like_newapi_quota(obj):
+        return None
+    for key in (
+        "awcoin",
+        "awCoin",
+        "AWCoin",
+        "aw_coin",
+        "awcoin_balance",
+        "wallet_balance",
+        "available_balance",
+        "availableBalance",
+        "remain_awcoin",
+        "balance",
+        "wallet",
+        "credit",
+        "available",
+        "remain",
+        "remaining",
+        "amount",
+    ):
+        if key in obj:
+            n = _as_finite_number(obj.get(key))
+            if n is not None:
+                return n
+    return None
+
+
+def _extract_awcoin(payload: Any) -> float | None:
+    direct = _as_finite_number(payload)
+    if direct is not None:
+        return direct
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("code") is not None and int(payload.get("code") or 0) != 0:
+        return None
+    if payload.get("success") is False:
+        return None
+    data = payload.get("data")
+    n = _as_finite_number(data)
+    if n is not None:
+        return n
+    found = _pick_awcoin(data)
+    if found is not None:
+        return found
+    if isinstance(data, dict):
+        for nested in (data.get("wallet"), data.get("account"), data.get("user")):
+            found = _pick_awcoin(nested)
+            if found is not None:
+                return found
+    return _pick_awcoin(payload)
+
+
+def _aipdd_get(base: str, key: str, path: str) -> dict[str, Any]:
+    host = urllib.parse.urlparse(base).hostname or ""
+    if "newapi.aipdd.work" in host or "susciyuan.com" in host:
+        raise RuntimeError("blocked host")
+    url = f"{base.rstrip('/')}{path}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "X-API-Key": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _volc_norm_query(params: dict[str, str]) -> str:
+    parts = []
+    for key in sorted(params):
+        parts.append(
+            f"{urllib.parse.quote(key, safe='-_.~')}={urllib.parse.quote(str(params[key]), safe='-_.~')}"
+        )
+    return "&".join(parts).replace("+", "%20")
+
+
+def _volc_sign(ak: str, sk: str, x_date: str) -> dict[str, str]:
+    query = {"Action": "QueryBalanceAcct", "Version": "2022-01-01"}
+    body = ""
+    x_content = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    signed_headers = "content-type;host;x-content-sha256;x-date"
+    canonical = "\n".join(
+        [
+            "GET",
+            "/",
+            _volc_norm_query(query),
+            "\n".join(
+                [
+                    f"content-type:{VOLC_CONTENT_TYPE}",
+                    f"host:{VOLC_BILLING_HOST}",
+                    f"x-content-sha256:{x_content}",
+                    f"x-date:{x_date}",
+                ]
+            ),
+            "",
+            signed_headers,
+            x_content,
+        ]
+    )
+    hashed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    short = x_date[:8]
+    scope = f"{short}/{VOLC_BILLING_REGION}/{VOLC_BILLING_SERVICE}/request"
+    string_to_sign = "\n".join(["HMAC-SHA256", x_date, scope, hashed])
+    k_date = hmac.new(sk.encode("utf-8"), short.encode("utf-8"), hashlib.sha256).digest()
+    k_region = hmac.new(k_date, VOLC_BILLING_REGION.encode("utf-8"), hashlib.sha256).digest()
+    k_service = hmac.new(k_region, VOLC_BILLING_SERVICE.encode("utf-8"), hashlib.sha256).digest()
+    k_signing = hmac.new(k_service, b"request", hashlib.sha256).digest()
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "query": _volc_norm_query(query),
+        "authorization": (
+            f"HMAC-SHA256 Credential={ak}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+        "x_date": x_date,
+        "x_content": x_content,
+    }
+
+
+def _fetch_volc_balance(ak: str, sk: str) -> float:
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    signed = _volc_sign(ak, sk, now)
+    url = f"https://{VOLC_BILLING_HOST}/?{signed['query']}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Host": VOLC_BILLING_HOST,
+            "Content-Type": VOLC_CONTENT_TYPE,
+            "X-Date": signed["x_date"],
+            "X-Content-Sha256": signed["x_content"],
+            "Authorization": signed["authorization"],
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        payload = json.loads(resp.read().decode())
+    meta = payload.get("ResponseMetadata") or {}
+    if meta.get("Error"):
+        raise RuntimeError("volc error")
+    result = payload.get("Result") if isinstance(payload.get("Result"), dict) else payload
+    raw = result.get("AvailableBalance")
+    if raw is None:
+        raw = result.get("CashBalance")
+    n = _as_finite_number(raw)
+    if n is None:
+        raise RuntimeError("volc balance missing")
+    return n
 
 
 def build_balances(env: dict[str, str], force: bool = False) -> dict[str, Any]:
-    """AIPDD / Volcengine remaining balances. Missing keys stay unconfigured."""
-    now = datetime.now(TZ_SH)
-    generated_at = now.strftime("%Y-%m-%d %H:%M:%S")
-    base = (env.get("AIPDD_BASE") or "https://api.aipdd.work").rstrip("/")
-    token = (env.get("AIPDD_ACCESS_TOKEN") or "").strip()
-    user_id = (env.get("AIPDD_USER_ID") or "1").strip() or "1"
-    channel_id = (env.get("VOLCES_CHANNEL_ID") or "").strip()
+    """Official AIPDD AWCoin + Volcengine billing balances. Missing keys stay unconfigured."""
+    generated_at = datetime.now(TZ_SH).strftime("%Y-%m-%d %H:%M:%S")
+    base = _aipdd_base(env)
+    aipdd_key = (env.get("AIPDD_API_KEY") or "").strip()
+    volc_ak = (env.get("VOLC_ACCESS_KEY_ID") or "").strip()
+    volc_sk = (env.get("VOLC_SECRET_ACCESS_KEY") or "").strip()
 
-    if not token:
+    if not aipdd_key and not (volc_ak and volc_sk):
+        missing = [k for k, v in (("VOLC_ACCESS_KEY_ID", volc_ak), ("VOLC_SECRET_ACCESS_KEY", volc_sk)) if not v]
         return {
             "ok": True,
-            "aipdd": _empty_aipdd("未配置 AIPDD_ACCESS_TOKEN"),
-            "volces": _empty_volces("未配置 AIPDD_ACCESS_TOKEN" if channel_id else "未配置 VOLCES_CHANNEL_ID"),
+            "aipdd": _empty_aipdd("未配置 AIPDD_API_KEY"),
+            "volces": _empty_volces("未配置 " + " / ".join(missing)),
             "generated_at": generated_at,
             "cached": False,
         }
@@ -540,71 +698,55 @@ def build_balances(env: dict[str, str], force: bool = False) -> dict[str, Any]:
         out["cached"] = True
         return out
 
-    status: dict[str, Any] = {}
-    try:
-        payload = api_get(base, token, user_id, "/api/status", {})
-        status = payload.get("data") or {}
-    except Exception:
-        status = {}
-    qpu = float(status.get("quota_per_unit") or 500000) or 500000
-    rate = float(status.get("usd_exchange_rate") or status.get("price") or 7.3) or 7.3
-
-    try:
-        self_payload = api_get(base, token, user_id, "/api/user/self", {})
-        if not self_payload.get("success", True):
-            raise RuntimeError("self failed")
-        user = self_payload.get("data") or {}
-        remain = float(user.get("quota") or 0)
-        money = money_from_quota(remain, qpu, rate)
-        aipdd = {
-            "configured": True,
-            "cny": money["cny"],
-            "usd": money["usd"],
-            "quota_remain": remain,
-            "error": None,
-        }
-    except Exception:
-        aipdd = {
-            "configured": True,
-            "cny": None,
-            "usd": None,
-            "quota_remain": None,
-            "error": "AIPDD 余额查询失败",
-        }
-
-    if not channel_id:
-        volces: dict[str, Any] = _empty_volces("未配置 VOLCES_CHANNEL_ID")
-    else:
+    rmb = DEFAULT_AWCOIN_RMB
+    usd_rate = None
+    if aipdd_key:
         try:
-            bal_payload = api_get(base, token, user_id, f"/api/channel/update_balance/{channel_id}", {})
-            if bal_payload.get("success") is False:
-                raise RuntimeError("balance failed")
-            raw, currency = _parse_channel_balance(bal_payload)
-            if raw is None:
-                raise RuntimeError("no balance")
-            if currency == "CNY":
-                volces = {
-                    "configured": True,
-                    "cny": round(raw, 4),
-                    "usd": round(raw / rate, 6),
-                    "error": None,
-                    "currency": "CNY",
-                }
-            else:
-                volces = {
-                    "configured": True,
-                    "cny": round(raw * rate, 4),
-                    "usd": round(raw, 6),
-                    "error": None,
-                    "currency": "USD",
-                }
+            rate_payload = _aipdd_get(base, aipdd_key, "/system/awcoin-rate")
+            data = rate_payload.get("data") if isinstance(rate_payload.get("data"), dict) else {}
+            rmb = _as_finite_number(data.get("rmb")) or DEFAULT_AWCOIN_RMB
+            usd_rate = _as_finite_number(data.get("usd"))
         except Exception:
-            volces = {
+            rmb = DEFAULT_AWCOIN_RMB
+
+    if aipdd_key:
+        awcoin = None
+        for path in AIPDD_WALLET_PATHS:
+            try:
+                payload = _aipdd_get(base, aipdd_key, path)
+                awcoin = _extract_awcoin(payload)
+                if awcoin is not None:
+                    break
+            except Exception:
+                continue
+        if awcoin is None:
+            aipdd = {
                 "configured": True,
                 "cny": None,
                 "usd": None,
-                "error": "火山引擎余额查询失败",
+                "awcoin": None,
+                "error": "AIPDD 余额查询失败",
             }
+        else:
+            aipdd = {
+                "configured": True,
+                "cny": round(awcoin * rmb, 4),
+                "usd": round(awcoin * usd_rate, 6) if usd_rate else None,
+                "awcoin": awcoin,
+                "error": None,
+            }
+    else:
+        aipdd = _empty_aipdd("未配置 AIPDD_API_KEY")
+
+    if not volc_ak or not volc_sk:
+        missing = [k for k, v in (("VOLC_ACCESS_KEY_ID", volc_ak), ("VOLC_SECRET_ACCESS_KEY", volc_sk)) if not v]
+        volces: dict[str, Any] = _empty_volces("未配置 " + " / ".join(missing))
+    else:
+        try:
+            cny = _fetch_volc_balance(volc_ak, volc_sk)
+            volces = {"configured": True, "cny": round(cny, 4), "usd": None, "error": None, "currency": "CNY"}
+        except Exception:
+            volces = {"configured": True, "cny": None, "usd": None, "error": "火山引擎余额查询失败"}
 
     payload = {
         "ok": True,

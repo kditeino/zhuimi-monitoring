@@ -508,13 +508,13 @@
       if (row.error || row.cny == null || !Number.isFinite(Number(row.cny))) {
         return { label: label, value: "—", hint: row.error || "查询失败", cls: "money" };
       }
-      let hint = "≈$" + Number(row.usd || 0).toFixed(4);
+      let hint = "";
       if (label.indexOf("火山") >= 0) {
-        hint = row.currency === "CNY"
-          ? "渠道余额（人民币）· ≈$" + Number(row.usd || 0).toFixed(4)
-          : "渠道余额按 USD × 汇率 · ≈$" + Number(row.usd || 0).toFixed(4);
-      } else if (row.quota_remain != null) {
-        hint = "剩余配额 " + Math.round(row.quota_remain) + " · ≈$" + Number(row.usd || 0).toFixed(4);
+        hint = "账户可用余额（人民币）";
+      } else if (row.awcoin != null) {
+        hint = String(row.awcoin) + " AWCoin";
+      } else {
+        hint = "官方 AIPDD 钱包";
       }
       return { label: label, value: money(row.cny), hint: hint, cls: "money" };
     }
@@ -524,8 +524,8 @@
       const bal = balances || {};
       const cards = [
         { label: "用量金额", value: money(m.usage_cny), hint: "配额 " + Math.round(m.usage_quota||0) + " · ≈$" + Number(m.usage_usd||0).toFixed(4), cls: "money" },
-        balanceCard("AIPDD剩余金额", bal.aipdd, "尚未配置 AIPDD_ACCESS_TOKEN"),
-        balanceCard("火山引擎剩余金额", bal.volces, "尚未配置 VOLCES_CHANNEL_ID"),
+        balanceCard("AIPDD剩余金额", bal.aipdd, "尚未配置 AIPDD_API_KEY"),
+        balanceCard("火山引擎剩余金额", bal.volces, "尚未配置 VOLC_ACCESS_KEY_ID"),
         { label: "任务 / 请求", value: String(m.total_requests ?? 0), hint: "消费 " + (m.consume_count||0) + " 条", cls: "" },
         { label: "错误总数", value: String(errN), hint: "type = 错误", cls: "error" },
         { label: "最多任务用户", value: m.top_task_user || "—", hint: (m.top_task_count||0) + " 次消费", cls: "" },

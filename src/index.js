@@ -16,6 +16,24 @@ const TZ = "Asia/Shanghai";
 
 let cache = { ts: 0, status: null, logs: null };
 let balancesCache = { ts: 0, payload: null };
+let aipddWalletPath = "";
+let aipddFailedPaths = [];
+let awcoinRateCache = { ts: 0, rmb: 0.0001, usd: 0.00001484 };
+
+const AIPDD_DEFAULT_BASE = "https://api.aipdd.work";
+const AIPDD_RATE_PATH = "/system/awcoin-rate";
+const DEFAULT_AWCOIN_RMB = 0.0001;
+// Probe order on official AIPDD (AWCoin). Unauthenticated GETs to all five
+// return AIPDD-style 401 {code,message,data}, so they exist. Runtime caches
+// the first path that yields a usable AWCoin balance. Do not call
+// newapi.aipdd.work (ImpToken) or susciyuan /api/user/self here.
+const AIPDD_WALLET_PATHS = ["/v1/user", "/v1/wallet", "/v1/account", "/v1/balance", "/api/user/self"];
+const VOLC_BILLING_HOST = "billing.volcengineapi.com";
+const VOLC_BILLING_SERVICE = "billing";
+const VOLC_BILLING_REGION = "cn-north-1";
+const VOLC_CONTENT_TYPE = "application/x-www-form-urlencoded";
+const RATE_CACHE_TTL_MS = 60 * 60 * 1000;
+const MAX_BALANCES_SUBREQ = 4;
 
 function envOf(runtime, key, fallback) {
   const baked = (typeof globalThis !== "undefined" && globalThis.BAKED_ENV) || {};
@@ -118,85 +136,198 @@ function isRefresh(url) {
   return refreshRaw === "1" || refreshRaw === "true" || refreshRaw === "yes";
 }
 
-function conversionFromStatus(status) {
-  const src = status && typeof status === "object" ? status : {};
-  const quotaPerUnit = Number(src.quota_per_unit || 500000);
-  const usdRate = Number(src.usd_exchange_rate || src.price || 7.3);
-  return {
-    quota_per_unit: quotaPerUnit > 0 ? quotaPerUnit : 500000,
-    usd_exchange_rate: usdRate > 0 ? usdRate : 7.3,
-  };
+function aipddBaseOf(runtime) {
+  const raw =
+    envOf(runtime, "AIPDD_BASE_URL", "") || envOf(runtime, "AIPDD_BASE", AIPDD_DEFAULT_BASE) || AIPDD_DEFAULT_BASE;
+  const cleaned = String(raw).replace(/\/+$/, "");
+  if (/newapi\.aipdd\.work/i.test(cleaned) || /susciyuan\.com/i.test(cleaned)) {
+    return AIPDD_DEFAULT_BASE;
+  }
+  return cleaned || AIPDD_DEFAULT_BASE;
 }
 
-function remainQuotaFromUser(user) {
-  const src = user && typeof user === "object" ? user : {};
-  // New API: quota is remaining; used_quota is cumulative consumed.
-  // Do not subtract used_quota (that would under-count the live balance).
-  const quota = Number(src.quota || 0);
-  return Number.isFinite(quota) ? quota : 0;
-}
-
-function inferBalanceCurrency(obj) {
-  if (!obj || typeof obj !== "object") return null;
-  const raw = obj.currency || obj.Currency || obj.quota_display_type || "";
-  const c = String(raw).trim().toUpperCase();
-  if (c === "CNY" || c === "RMB") return "CNY";
-  if (c === "USD") return "USD";
+function asFiniteNumber(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() && !Number.isNaN(Number(v))) return Number(v);
   return null;
 }
 
-function parseChannelBalance(payload) {
-  if (payload == null) return { value: null, currency: null };
-  if (typeof payload === "number" && Number.isFinite(payload)) {
-    return { value: payload, currency: null };
-  }
-  if (typeof payload !== "object") return { value: null, currency: null };
-  const nested = payload.data && typeof payload.data === "object" ? payload.data : null;
-  const currency = inferBalanceCurrency(nested) || inferBalanceCurrency(payload);
-  const candidates = [
-    payload.balance_cny,
-    nested && nested.balance_cny,
-    payload.cny,
-    nested && nested.cny,
-    payload.balance,
-    payload.data,
-    nested && nested.balance,
-    nested && nested.usd,
-    payload.usd,
+function looksLikeRatePayload(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  const keys = Object.keys(obj);
+  return keys.includes("rmb") && keys.includes("usd") && !keys.some((k) => /awcoin|balance|wallet|credit/i.test(k));
+}
+
+function looksLikeNewApiQuota(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  const hasQuota = obj.quota != null && obj.used_quota != null;
+  const hasAwcoin = obj.awcoin != null || obj.awCoin != null || obj.aw_coin != null;
+  return hasQuota && !hasAwcoin;
+}
+
+function pickAwcoinFromObject(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  if (looksLikeRatePayload(obj) || looksLikeNewApiQuota(obj)) return null;
+  const preferred = [
+    "awcoin",
+    "awCoin",
+    "AWCoin",
+    "aw_coin",
+    "awcoin_balance",
+    "wallet_balance",
+    "available_balance",
+    "availableBalance",
+    "remain_awcoin",
+    "balance",
+    "wallet",
+    "credit",
+    "available",
+    "remain",
+    "remaining",
+    "amount",
   ];
-  for (const cand of candidates) {
-    if (typeof cand === "number" && Number.isFinite(cand)) {
-      const forced =
-        cand === payload.balance_cny ||
-        cand === (nested && nested.balance_cny) ||
-        cand === payload.cny ||
-        cand === (nested && nested.cny)
-          ? "CNY"
-          : cand === payload.usd || cand === (nested && nested.usd)
-            ? "USD"
-            : currency;
-      return { value: cand, currency: forced };
-    }
-    if (typeof cand === "string" && cand.trim() && !Number.isNaN(Number(cand))) {
-      return { value: Number(cand), currency };
-    }
+  for (const key of preferred) {
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+    const n = asFiniteNumber(obj[key]);
+    if (n != null) return n;
   }
-  return { value: null, currency };
+  return null;
 }
 
-function channelMoney(rawValue, currency, usdRate) {
-  const n = Number(rawValue);
-  if (!Number.isFinite(n)) return { cny: null, usd: null, currency: currency || "USD" };
-  if (currency === "CNY") {
-    const rate = usdRate > 0 ? usdRate : 7.3;
-    return { cny: roundN(n, 4), usd: roundN(n / rate, 6), currency: "CNY" };
+function extractAwcoin(payload) {
+  if (payload == null) return null;
+  const direct = asFiniteNumber(payload);
+  if (direct != null) return direct;
+  if (typeof payload !== "object") return null;
+  if (payload.code != null && Number(payload.code) !== 0) return null;
+  if (payload.success === false) return null;
+  const data = payload.data;
+  if (asFiniteNumber(data) != null) return asFiniteNumber(data);
+  const fromData = pickAwcoinFromObject(data);
+  if (fromData != null) return fromData;
+  if (data && typeof data === "object") {
+    const nestedWallet = pickAwcoinFromObject(data.wallet) || pickAwcoinFromObject(data.account) || pickAwcoinFromObject(data.user);
+    if (nestedWallet != null) return nestedWallet;
   }
-  const rate = usdRate > 0 ? usdRate : 7.3;
-  return { cny: roundN(n * rate, 4), usd: roundN(n, 6), currency: "USD" };
+  return pickAwcoinFromObject(payload);
 }
 
-function safeBalanceError(fallback) {
-  return fallback || "查询失败";
+function extractAwcoinRate(payload) {
+  const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+  const rmb = asFiniteNumber(data && data.rmb);
+  const usd = asFiniteNumber(data && data.usd);
+  return {
+    rmb: rmb != null && rmb > 0 ? rmb : DEFAULT_AWCOIN_RMB,
+    usd: usd != null && usd > 0 ? usd : null,
+  };
+}
+
+function parseVolcBalance(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const meta = payload.ResponseMetadata;
+  if (meta && meta.Error) return null;
+  const result = payload.Result && typeof payload.Result === "object" ? payload.Result : payload;
+  const raw = result.AvailableBalance != null ? result.AvailableBalance : result.CashBalance;
+  return asFiniteNumber(raw);
+}
+
+function hexFromBuf(buf) {
+  return Array.from(new Uint8Array(buf), function (b) {
+    return b.toString(16).padStart(2, "0");
+  }).join("");
+}
+
+function volcXDate(date) {
+  const d = date || new Date();
+  return d.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+}
+
+function uriEncodeRfc3986(s) {
+  return encodeURIComponent(String(s)).replace(/[!'()*]/g, function (c) {
+    return "%" + c.charCodeAt(0).toString(16).toUpperCase();
+  });
+}
+
+function normQuery(params) {
+  return Object.keys(params)
+    .sort()
+    .map(function (k) {
+      return uriEncodeRfc3986(k) + "=" + uriEncodeRfc3986(params[k]);
+    })
+    .join("&");
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return hexFromBuf(digest);
+}
+
+async function hmacSha256Raw(keyBytes, text) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(text));
+  return new Uint8Array(sig);
+}
+
+async function signVolcengineV4(opts) {
+  const method = (opts.method || "GET").toUpperCase();
+  const path = opts.path || "/";
+  const host = opts.host;
+  const service = opts.service;
+  const region = opts.region || VOLC_BILLING_REGION;
+  const query = opts.query || {};
+  const body = opts.body || "";
+  const contentType = opts.contentType || VOLC_CONTENT_TYPE;
+  const xDate = opts.xDate;
+  const shortDate = xDate.slice(0, 8);
+  const xContentSha256 = await sha256Hex(body);
+  const signedHeaders = "content-type;host;x-content-sha256;x-date";
+  const canonicalHeaders =
+    "content-type:" +
+    contentType +
+    "\n" +
+    "host:" +
+    host +
+    "\n" +
+    "x-content-sha256:" +
+    xContentSha256 +
+    "\n" +
+    "x-date:" +
+    xDate +
+    "\n";
+  const canonicalRequest = [method, path, normQuery(query), canonicalHeaders, signedHeaders, xContentSha256].join("\n");
+  const hashedCanon = await sha256Hex(canonicalRequest);
+  const credentialScope = shortDate + "/" + region + "/" + service + "/request";
+  const stringToSign = ["HMAC-SHA256", xDate, credentialScope, hashedCanon].join("\n");
+  const enc = new TextEncoder();
+  const kDate = await hmacSha256Raw(enc.encode(opts.sk), shortDate);
+  const kRegion = await hmacSha256Raw(kDate, region);
+  const kService = await hmacSha256Raw(kRegion, service);
+  const kSigning = await hmacSha256Raw(kService, "request");
+  const signature = hexFromBuf(await hmacSha256Raw(kSigning, stringToSign));
+  return {
+    authorization:
+      "HMAC-SHA256 Credential=" +
+      opts.ak +
+      "/" +
+      credentialScope +
+      ", SignedHeaders=" +
+      signedHeaders +
+      ", Signature=" +
+      signature,
+    xDate: xDate,
+    xContentSha256: xContentSha256,
+    contentType: contentType,
+    host: host,
+    signature: signature,
+    credentialScope: credentialScope,
+    canonicalRequest: canonicalRequest,
+  };
 }
 
 function parseOther(raw) {
@@ -449,25 +580,170 @@ async function handleOverview(request, runtime) {
 }
 
 function emptyAipdd(error) {
-  return { configured: false, cny: null, usd: null, quota_remain: null, error: error || null };
+  return { configured: false, cny: null, usd: null, awcoin: null, error: error || null };
 }
 
 function emptyVolces(error) {
   return { configured: false, cny: null, usd: null, error: error || null };
 }
 
+function resetBalancesState() {
+  balancesCache = { ts: 0, payload: null };
+  aipddWalletPath = "";
+  aipddFailedPaths = [];
+  awcoinRateCache = { ts: 0, rmb: DEFAULT_AWCOIN_RMB, usd: 0.00001484 };
+}
+
+function assertAipddHost(url) {
+  const host = String(url).toLowerCase();
+  if (host.includes("newapi.aipdd.work") || host.includes("susciyuan.com") || host.includes("ark.cn-beijing.volces.com")) {
+    const err = new Error("blocked host");
+    err.status = 500;
+    throw err;
+  }
+}
+
+async function aipddGetJson(base, key, path) {
+  const root = base.endsWith("/") ? base : base + "/";
+  const url = new URL(path, root);
+  assertAipddHost(url.hostname);
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    redirect: "manual",
+    headers: {
+      "X-API-Key": key,
+      Authorization: "Bearer " + key,
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok || (res.status >= 300 && res.status < 400)) {
+    const err = new Error("upstream HTTP " + res.status);
+    err.status = 502;
+    throw err;
+  }
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const err = new Error("upstream invalid JSON");
+    err.status = 502;
+    throw err;
+  }
+}
+
+async function fetchAwcoinRate(base) {
+  const now = Date.now();
+  if (awcoinRateCache.ts && now - awcoinRateCache.ts < RATE_CACHE_TTL_MS) {
+    return { rmb: awcoinRateCache.rmb, usd: awcoinRateCache.usd, cached: true };
+  }
+  const root = base.endsWith("/") ? base : base + "/";
+  const url = new URL(AIPDD_RATE_PATH, root);
+  assertAipddHost(url.hostname);
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    redirect: "manual",
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    return { rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: false };
+  }
+  const payload = JSON.parse(await res.text());
+  const rate = extractAwcoinRate(payload);
+  awcoinRateCache = { ts: Date.now(), rmb: rate.rmb, usd: rate.usd };
+  return { rmb: rate.rmb, usd: rate.usd, cached: false };
+}
+
+async function probeAipddWallet(base, key, budget) {
+  const tried = [];
+  const paths = [];
+  if (aipddWalletPath && aipddFailedPaths.indexOf(aipddWalletPath) < 0) paths.push(aipddWalletPath);
+  for (let i = 0; i < AIPDD_WALLET_PATHS.length; i++) {
+    const p = AIPDD_WALLET_PATHS[i];
+    if (paths.indexOf(p) < 0 && aipddFailedPaths.indexOf(p) < 0) paths.push(p);
+  }
+  if (!paths.length) {
+    aipddFailedPaths = [];
+    paths.push.apply(paths, AIPDD_WALLET_PATHS);
+  }
+  const limit = Math.max(1, Math.min(budget, paths.length));
+  for (let i = 0; i < limit; i++) {
+    const path = paths[i];
+    tried.push(path);
+    try {
+      const payload = await aipddGetJson(base, key, path);
+      const awcoin = extractAwcoin(payload);
+      if (awcoin != null) {
+        aipddWalletPath = path;
+        return { awcoin: awcoin, path: path, tried: tried };
+      }
+    } catch {
+      // try next documented path; never surface upstream text
+    }
+    if (aipddFailedPaths.indexOf(path) < 0) aipddFailedPaths.push(path);
+  }
+  return { awcoin: null, path: "", tried: tried };
+}
+
+async function fetchVolcBalance(ak, sk, now) {
+  const query = { Action: "QueryBalanceAcct", Version: "2022-01-01" };
+  const signed = await signVolcengineV4({
+    method: "GET",
+    path: "/",
+    host: VOLC_BILLING_HOST,
+    service: VOLC_BILLING_SERVICE,
+    region: VOLC_BILLING_REGION,
+    query: query,
+    body: "",
+    contentType: VOLC_CONTENT_TYPE,
+    ak: ak,
+    sk: sk,
+    xDate: volcXDate(now),
+  });
+  const url = "https://" + VOLC_BILLING_HOST + "/?" + normQuery(query);
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "manual",
+    headers: {
+      Host: signed.host,
+      "Content-Type": signed.contentType,
+      "X-Date": signed.xDate,
+      "X-Content-Sha256": signed.xContentSha256,
+      Authorization: signed.authorization,
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok || (res.status >= 300 && res.status < 400)) {
+    const err = new Error("upstream HTTP " + res.status);
+    err.status = 502;
+    throw err;
+  }
+  const payload = JSON.parse(await res.text());
+  const cny = parseVolcBalance(payload);
+  if (cny == null) {
+    const err = new Error("volc balance missing");
+    err.status = 502;
+    throw err;
+  }
+  return cny;
+}
+
 async function handleBalances(request, runtime) {
-  const base = envOf(runtime, "AIPDD_BASE", "https://api.aipdd.work").replace(/\/+$/, "");
-  const token = envOf(runtime, "AIPDD_ACCESS_TOKEN", "");
-  const userId = envOf(runtime, "AIPDD_USER_ID", "1") || "1";
-  const channelId = envOf(runtime, "VOLCES_CHANNEL_ID", "");
+  const base = aipddBaseOf(runtime).replace(/\/+$/, "") || AIPDD_DEFAULT_BASE;
+  const aipddKey = envOf(runtime, "AIPDD_API_KEY", "");
+  const volcAk = envOf(runtime, "VOLC_ACCESS_KEY_ID", "");
+  const volcSk = envOf(runtime, "VOLC_SECRET_ACCESS_KEY", "");
   const generatedAt = formatFull(new Date());
 
-  if (!token) {
+  const aipddReady = Boolean(aipddKey);
+  const volcReady = Boolean(volcAk && volcSk);
+  if (!aipddReady && !volcReady) {
+    const volcMissing = [];
+    if (!volcAk) volcMissing.push("VOLC_ACCESS_KEY_ID");
+    if (!volcSk) volcMissing.push("VOLC_SECRET_ACCESS_KEY");
     return json(200, {
       ok: true,
-      aipdd: emptyAipdd("未配置 AIPDD_ACCESS_TOKEN"),
-      volces: emptyVolces(channelId ? "未配置 AIPDD_ACCESS_TOKEN" : "未配置 VOLCES_CHANNEL_ID"),
+      aipdd: emptyAipdd("未配置 AIPDD_API_KEY"),
+      volces: emptyVolces("未配置 " + volcMissing.join(" / ")),
       generated_at: generatedAt,
       cached: false,
     });
@@ -480,85 +756,62 @@ async function handleBalances(request, runtime) {
     return json(200, Object.assign({}, balancesCache.payload, { cached: true }));
   }
 
-  const wantVolces = Boolean(channelId);
-  const statusP = fetchStatus(base, token, userId).catch(function () {
-    return null;
-  });
-  const selfP = apiGet(base, token, userId, "/api/user/self", null).then(
-    function (payload) {
-      return { ok: true, payload: payload };
-    },
-    function () {
-      return { ok: false };
-    }
-  );
-  const volcesP = wantVolces
-    ? apiGet(base, token, userId, "/api/channel/update_balance/" + encodeURIComponent(channelId), null).then(
-        function (payload) {
-          return { ok: true, payload: payload };
-        },
-        function () {
-          return { ok: false };
-        }
-      )
-    : Promise.resolve(null);
+  let used = 0;
+  let rateP = Promise.resolve({ rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: true });
+  let aipddP = Promise.resolve(null);
+  let volcP = Promise.resolve(null);
 
-  const settled = await Promise.all([statusP, selfP, volcesP]);
-  const conv = conversionFromStatus(settled[0]);
-  const selfRes = settled[1];
-  const volcesRes = settled[2];
+  if (volcReady) {
+    used += 1;
+    volcP = fetchVolcBalance(volcAk, volcSk, new Date()).then(
+      function (cny) {
+        return { ok: true, cny: cny };
+      },
+      function () {
+        return { ok: false };
+      }
+    );
+  }
+
+  if (aipddReady) {
+    const rateFresh = awcoinRateCache.ts && now - awcoinRateCache.ts < RATE_CACHE_TTL_MS;
+    if (!rateFresh && used < MAX_BALANCES_SUBREQ) {
+      used += 1;
+      rateP = fetchAwcoinRate(base).catch(function () {
+        return { rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: false };
+      });
+    }
+    const walletBudget = Math.max(1, MAX_BALANCES_SUBREQ - used);
+    aipddP = probeAipddWallet(base, aipddKey, walletBudget);
+  }
+
+  const settled = await Promise.all([rateP, aipddP, volcP]);
+  const rate = settled[0] || { rmb: DEFAULT_AWCOIN_RMB, usd: null };
+  const wallet = settled[1];
+  const volcRes = settled[2];
 
   let aipdd;
-  if (!selfRes.ok || !selfRes.payload || selfRes.payload.success === false) {
-    aipdd = {
-      configured: true,
-      cny: null,
-      usd: null,
-      quota_remain: null,
-      error: safeBalanceError("AIPDD 余额查询失败"),
-    };
+  if (!aipddReady) {
+    aipdd = emptyAipdd("未配置 AIPDD_API_KEY");
+  } else if (!wallet || wallet.awcoin == null) {
+    aipdd = { configured: true, cny: null, usd: null, awcoin: null, error: "AIPDD 余额查询失败" };
   } else {
-    const user = selfRes.payload.data || {};
-    const remain = remainQuotaFromUser(user);
-    const money = moneyFromQuota(remain, conv.quota_per_unit, conv.usd_exchange_rate);
-    aipdd = {
-      configured: true,
-      cny: money.cny,
-      usd: money.usd,
-      quota_remain: remain,
-      error: null,
-    };
+    const rmb = rate.rmb > 0 ? rate.rmb : DEFAULT_AWCOIN_RMB;
+    const cny = roundN(wallet.awcoin * rmb, 4);
+    const usd = rate.usd != null ? roundN(wallet.awcoin * rate.usd, 6) : null;
+    aipdd = { configured: true, cny: cny, usd: usd, awcoin: wallet.awcoin, error: null };
   }
 
   let volces;
-  if (!wantVolces) {
-    volces = emptyVolces("未配置 VOLCES_CHANNEL_ID");
-  } else if (!volcesRes || !volcesRes.ok || !volcesRes.payload || volcesRes.payload.success === false) {
-    volces = {
-      configured: true,
-      cny: null,
-      usd: null,
-      error: safeBalanceError("火山引擎余额查询失败"),
-    };
+  if (!volcAk || !volcSk) {
+    const missing = [];
+    if (!volcAk) missing.push("VOLC_ACCESS_KEY_ID");
+    if (!volcSk) missing.push("VOLC_SECRET_ACCESS_KEY");
+    volces = emptyVolces("未配置 " + missing.join(" / "));
+  } else if (!volcRes || !volcRes.ok) {
+    volces = { configured: true, cny: null, usd: null, error: "火山引擎余额查询失败" };
   } else {
-    const parsed = parseChannelBalance(volcesRes.payload);
-    if (parsed.value == null) {
-      volces = {
-        configured: true,
-        cny: null,
-        usd: null,
-        error: safeBalanceError("火山引擎余额查询失败"),
-      };
-    } else {
-      const money = channelMoney(parsed.value, parsed.currency, conv.usd_exchange_rate);
-      volces = {
-        configured: true,
-        cny: money.cny,
-        usd: money.usd,
-        error: null,
-        currency: money.currency,
-      };
-    }
+    volces = { configured: true, cny: roundN(volcRes.cny, 4), usd: null, error: null, currency: "CNY" };
   }
 
   const payload = {
@@ -573,10 +826,13 @@ async function handleBalances(request, runtime) {
 }
 
 export {
-  remainQuotaFromUser,
-  parseChannelBalance,
-  channelMoney,
-  conversionFromStatus,
+  extractAwcoin,
+  extractAwcoinRate,
+  parseVolcBalance,
+  signVolcengineV4,
+  volcXDate,
+  normQuery,
+  resetBalancesState,
 };
 
 export default {
