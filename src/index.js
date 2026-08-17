@@ -55,15 +55,29 @@ function json(status, obj) {
   });
 }
 
-function unauthorized() {
-  return new Response("Unauthorized", {
+const SESSION_COOKIE = "zm_sid";
+const SESSION_DAYS = 7;
+const SESSION_PEPPER = "zhuimi-monitor-session-v1";
+
+function jsonUnauthorized() {
+  return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
     status: 401,
     headers: {
-      "WWW-Authenticate": 'Basic realm="Zhuimi Monitor"',
-      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
     },
   });
+}
+
+function htmlPage(status, body, extraHeaders) {
+  const headers = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+  };
+  if (extraHeaders) {
+    for (const [k, v] of Object.entries(extraHeaders)) headers[k] = v;
+  }
+  return new Response(body, { status: status, headers: headers });
 }
 
 function safeEqual(a, b) {
@@ -78,17 +92,117 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-function checkBasic(request, user, password) {
-  const header = request.headers.get("Authorization") || "";
-  if (!header.startsWith("Basic ")) return false;
+function cookieHeader(request, name) {
+  const raw = request.headers.get("Cookie") || "";
+  const parts = raw.split(";");
+  for (let i = 0; i < parts.length; i++) {
+    const piece = parts[i].trim();
+    const eq = piece.indexOf("=");
+    if (eq < 0) continue;
+    if (piece.slice(0, eq) === name) return piece.slice(eq + 1);
+  }
+  return "";
+}
+
+function b64urlEncode(text) {
+  return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function b64urlDecode(text) {
+  const s = String(text || "").replace(/-/g, "+").replace(/_/g, "/");
+  const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+  return atob(s + pad);
+}
+
+async function sessionKeyBytes(password) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(password) + SESSION_PEPPER));
+  return new Uint8Array(digest);
+}
+
+async function signSessionPayload(password, payload) {
+  const sig = await hmacSha256Raw(await sessionKeyBytes(password), payload);
+  return hexFromBuf(sig);
+}
+
+async function makeSessionToken(user, password, nowMs) {
+  const exp = Math.floor(Number(nowMs || Date.now()) / 1000) + SESSION_DAYS * 86400;
+  const payload = "v1|" + String(user) + "|" + exp;
+  return b64urlEncode(payload) + "." + (await signSessionPayload(password, payload));
+}
+
+async function verifySessionToken(token, user, password, nowMs) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 2) return false;
+  let payload = "";
   try {
-    const raw = atob(header.slice(6).trim());
-    const idx = raw.indexOf(":");
-    if (idx < 0) return false;
-    return safeEqual(raw.slice(0, idx), user) && safeEqual(raw.slice(idx + 1), password);
+    payload = b64urlDecode(parts[0]);
   } catch {
     return false;
   }
+  const expected = await signSessionPayload(password, payload);
+  if (!safeEqual(expected, parts[1])) return false;
+  const bits = payload.split("|");
+  if (bits.length !== 3 || bits[0] !== "v1" || !safeEqual(bits[1], user)) return false;
+  const exp = Number(bits[2]);
+  return Number.isFinite(exp) && exp > Math.floor(Number(nowMs || Date.now()) / 1000);
+}
+
+function sessionCookieValue(token, requestUrl, clear) {
+  const secure = String(requestUrl || "").startsWith("https:") ? "; Secure" : "";
+  if (clear) {
+    return SESSION_COOKIE + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax" + secure;
+  }
+  const maxAge = SESSION_DAYS * 86400;
+  return (
+    SESSION_COOKIE +
+    "=" +
+    token +
+    "; Path=/; Max-Age=" +
+    maxAge +
+    "; HttpOnly; SameSite=Lax" +
+    secure
+  );
+}
+
+function renderLoginPage(error) {
+  const baked = typeof globalThis !== "undefined" ? globalThis.BAKED_LOGIN_HTML : "";
+  const err = error
+    ? '<div class="banner err" id="loginError">账号或密码不对</div>'
+    : "";
+  if (baked) return String(baked).replace("<!--ERROR-->", err);
+  return (
+    "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\" /><title>追觅客户监控</title></head>" +
+    "<body><h1>追觅客户监控</h1>" +
+    err +
+    "<form method=\"post\" action=\"/login\">" +
+    "<label for=\"username\">用户名</label>" +
+    "<input type=\"text\" name=\"username\" id=\"username\" autocomplete=\"username\" required />" +
+    "<label for=\"password\">密码</label>" +
+    "<input type=\"password\" name=\"password\" id=\"password\" autocomplete=\"current-password\" required />" +
+    "<button type=\"submit\">登录</button></form></body></html>"
+  );
+}
+
+function renderAppPage() {
+  const baked = typeof globalThis !== "undefined" ? globalThis.BAKED_APP_HTML : "";
+  return baked || "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\" /><title>追觅客户监控</title></head><body>追觅客户监控</body></html>";
+}
+
+async function readLoginForm(request) {
+  const ctype = request.headers.get("Content-Type") || "";
+  if (ctype.includes("multipart/form-data") && request.formData) {
+    const fd = await request.formData();
+    return {
+      username: String(fd.get("username") || ""),
+      password: String(fd.get("password") || ""),
+    };
+  }
+  const text = await request.text();
+  const params = new URLSearchParams(text);
+  return {
+    username: String(params.get("username") || ""),
+    password: String(params.get("password") || ""),
+  };
 }
 
 function shanghaiParts(date) {
@@ -833,16 +947,17 @@ export {
   volcXDate,
   normQuery,
   resetBalancesState,
+  makeSessionToken,
+  verifySessionToken,
+  renderLoginPage,
+  SESSION_COOKIE,
 };
 
 export default {
   async fetch(request, env) {
     const runtime = env || {};
     const password = envOf(runtime, "DASHBOARD_PASSWORD", "");
-    if (password) {
-      const user = envOf(runtime, "DASHBOARD_USER", "zhuimi") || "zhuimi";
-      if (!checkBasic(request, user, password)) return unauthorized();
-    }
+    const user = envOf(runtime, "DASHBOARD_USER", "zhuimi") || "zhuimi";
     let url;
     try {
       url = new URL(request.url);
@@ -850,12 +965,68 @@ export default {
       return json(400, { ok: false, error: "bad url" });
     }
     const path = url.pathname;
+
     try {
-      if (request.method !== "GET") {
-        return json(405, { ok: false, error: "method not allowed" });
+      if (path === "/login" && request.method === "POST") {
+        if (!password) {
+          return new Response(null, { status: 302, headers: { Location: "/", "Cache-Control": "no-store" } });
+        }
+        const form = await readLoginForm(request);
+        const ok = safeEqual(form.username, user) && safeEqual(form.password, password);
+        if (!ok) {
+          return htmlPage(200, renderLoginPage(true));
+        }
+        const token = await makeSessionToken(user, password, Date.now());
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: "/",
+            "Set-Cookie": sessionCookieValue(token, request.url, false),
+            "Cache-Control": "no-store",
+          },
+        });
       }
+
+      if ((path === "/logout" || path === "/logout/") && (request.method === "GET" || request.method === "POST")) {
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: "/",
+            "Set-Cookie": sessionCookieValue("", request.url, true),
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+
+      if (path === "/login" && request.method === "GET") {
+        return htmlPage(200, renderLoginPage(false));
+      }
+
+      const authed =
+        !password || (await verifySessionToken(cookieHeader(request, SESSION_COOKIE), user, password, Date.now()));
+
+      if (path === "/api/session") {
+        if (!authed) return jsonUnauthorized();
+        return json(200, { ok: true });
+      }
+
       if (path === "/api/health") {
         return json(200, { ok: true });
+      }
+
+      if (password && !authed) {
+        if (path.startsWith("/api/")) return jsonUnauthorized();
+        if (request.method === "GET" && (path === "/" || path === "/index.html" || path === "/app.html")) {
+          return htmlPage(200, renderLoginPage(false));
+        }
+      }
+
+      if (request.method === "GET" && (path === "/" || path === "/index.html" || path === "/app.html")) {
+        return htmlPage(200, renderAppPage());
+      }
+
+      if (request.method !== "GET") {
+        return json(405, { ok: false, error: "method not allowed" });
       }
       if (path === "/api/overview") {
         return await handleOverview(request, runtime);

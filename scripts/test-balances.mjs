@@ -235,10 +235,13 @@ describe("balances and latest-log UI", { concurrency: 1 }, () => {
     assert.ok(!html.includes("findIndex(l => l.type === 5)"));
   });
 
-  test("Basic Auth still wraps /api/balances", async () => {
+  test("cookie auth wraps /api/balances without Basic popup", async () => {
     globalThis.BAKED_ENV = { DASHBOARD_PASSWORD: "pw", DASHBOARD_USER: "zhuimi" };
     const res = await worker.fetch(new Request("https://monitor.test/api/balances"), {});
     assert.equal(res.status, 401);
+    assert.equal(res.headers.get("WWW-Authenticate"), null);
+    const body = await res.json();
+    assert.equal(body.error, "unauthorized");
   });
 
   test("build bake keys no longer include the old New API balance names", () => {

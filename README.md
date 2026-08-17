@@ -31,6 +31,8 @@ ESA 构建信息里的环境变量会在 `npm run build` 时打进边缘函数�
 
 ESA 构建环境变量还要加上 `AIPDD_BASE_URL`、`AIPDD_API_KEY`、`VOLC_ACCESS_KEY_ID`、`VOLC_SECRET_ACCESS_KEY`（只加名字，不要写真实值），加完后重新构建。
 
+登录已改成网页表单，账号密码仍是 `DASHBOARD_USER` / `DASHBOARD_PASSWORD`。浏览器不再弹出 Basic Auth 窗口，密码管理器可以记住这两个输入框。
+
 ### 重建步骤
 
 1. 把代码推送到 GitHub 仓库 `main` 分支。
@@ -78,8 +80,8 @@ python3 render_report.py --period evening
 | `SUSCIYUAN_BASE` | New API 站点根 URL（ESA 默认 `https://susciyuan.com`） |
 | `SUSCIYUAN_ACCESS_TOKEN` | New API 访问令牌（仅服务端 / 边缘函数） |
 | `SUSCIYUAN_USER_ID` | New API 用户 id（默认 `1`） |
-| `DASHBOARD_USER` | 看板 HTTP Basic 用户名（默认 `zhuimi`） |
-| `DASHBOARD_PASSWORD` | 看板 HTTP Basic 密码（未设置则不启用鉴权） |
+| `DASHBOARD_USER` | 看板登录用户名（默认 `zhuimi`） |
+| `DASHBOARD_PASSWORD` | 看板登录密码（未设置则不启用鉴权） |
 | `AIPDD_BASE_URL` | 官方 AIPDD 根 URL（默认 `https://api.aipdd.work`，不要填 ImpToken / newapi.aipdd.work） |
 | `AIPDD_API_KEY` | 官方 AIPDD API Key（与 susciyuan 渠道 3 同一把；未配置则该卡显示「待配置」） |
 | `VOLC_ACCESS_KEY_ID` | 火山引擎账单 AK（未配置则该卡显示「待配置」） |
@@ -94,7 +96,11 @@ python3 render_report.py --period evening
 
 | 路径 | 说明 |
 |------|------|
-| `GET /` | H5 看板（ESA 静态 `dist/index.html`，或 Python 读取 `static/index.html`） |
+| `GET /` | 未登录为网页登录表单；已登录后进入看板（ESA 静态登录页 + `/app.html`） |
+| `POST /login` | 校验看板账号，写入 HttpOnly 会话 cookie，302 到 `/` |
+| `GET /logout` | 清除会话 cookie 并回到登录页 |
+| `GET /app.html` | H5 看板 |
+| `GET /api/session` | 会话是否有效（未登录 JSON 401，不带 Basic 弹窗） |
 | `GET /api/overview` | 指标 + 近 3 天日志（`?refresh=1` 跳过缓存） |
 | `GET /api/balances` | 官方 AIPDD AWCoin 剩余 + 火山引擎账单可用余额（`?refresh=1` 跳过约 45s 缓存；不增加 overview 出站请求） |
 | `GET /api/report?hours=12` | 结构化摘要（仅 Python） |
@@ -107,7 +113,8 @@ python3 render_report.py --period evening
 - `package.json` — ESA 构建脚本（无运行时依赖）
 - `scripts/build.mjs` — 将 `static/` 复制到 `dist/`，并生成 `dist-worker/index.js`
 - `src/index.js` — ESA 边缘函数（`/api/health`、`/api/overview`、`/api/balances`）
-- `static/index.html` — H5 界面（构建后进入 `dist/`）
+- `static/index.html` — H5 看板（构建后为 `dist/app.html`）
+- `static/login.html` — 网页登录表单（构建后为 `dist/index.html`）
 - `static/404.html` — ESA `404Page` 回退页
 - `app.py` — Python 看板服务
 - `monitor.py` — 错误日志轮询

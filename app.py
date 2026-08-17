@@ -21,6 +21,11 @@ import hashlib
 import hmac
 
 
+SESSION_COOKIE = "zm_sid"
+SESSION_DAYS = 7
+SESSION_PEPPER = "zhuimi-monitor-session-v1"
+
+
 def _dashboard_creds(env: dict[str, str]) -> tuple[str, str] | None:
     user = (env.get("DASHBOARD_USER") or "").strip()
     pw = (env.get("DASHBOARD_PASSWORD") or "").strip()
@@ -29,38 +34,88 @@ def _dashboard_creds(env: dict[str, str]) -> tuple[str, str] | None:
     return (user or "zhuimi", pw)
 
 
-def _check_basic_auth(handler: "Handler", env: dict[str, str]) -> bool:
+def _session_key(password: str) -> bytes:
+    return hashlib.sha256((password + SESSION_PEPPER).encode("utf-8")).digest()
+
+
+def _make_session_token(user: str, password: str) -> str:
+    exp = int(time.time()) + SESSION_DAYS * 86400
+    payload = f"v1|{user}|{exp}"
+    raw = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+    sig = hmac.new(_session_key(password), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}"
+
+
+def _verify_session_token(token: str, user: str, password: str) -> bool:
+    parts = (token or "").split(".")
+    if len(parts) != 2:
+        return False
+    raw, got_sig = parts
+    pad = "=" * (-len(raw) % 4)
+    try:
+        payload = base64.urlsafe_b64decode(raw + pad).decode("utf-8")
+    except Exception:
+        return False
+    expect = hmac.new(_session_key(password), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expect, got_sig):
+        return False
+    bits = payload.split("|")
+    if len(bits) != 3 or bits[0] != "v1" or not hmac.compare_digest(bits[1], user):
+        return False
+    try:
+        exp = int(bits[2])
+    except ValueError:
+        return False
+    return exp > int(time.time())
+
+
+def _cookie_from_headers(handler: "Handler", name: str) -> str:
+    raw = handler.headers.get("Cookie") or ""
+    for part in raw.split(";"):
+        piece = part.strip()
+        if "=" not in piece:
+            continue
+        k, v = piece.split("=", 1)
+        if k == name:
+            return v
+    return ""
+
+
+def _session_cookie(token: str, secure: bool, clear: bool = False) -> str:
+    flags = "Path=/; HttpOnly; SameSite=Lax"
+    if secure:
+        flags += "; Secure"
+    if clear:
+        return f"{SESSION_COOKIE}=; {flags}; Max-Age=0"
+    return f"{SESSION_COOKIE}={token}; {flags}; Max-Age={SESSION_DAYS * 86400}"
+
+
+def _is_authed(handler: "Handler", env: dict[str, str]) -> bool:
     creds = _dashboard_creds(env)
     if creds is None:
         return True
     user, pw = creds
-    header = handler.headers.get("Authorization") or ""
-    if not header.startswith("Basic "):
-        return False
-    try:
-        raw = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
-        got_user, got_pw = raw.split(":", 1)
-    except Exception:
-        return False
-    return hmac.compare_digest(got_user, user) and hmac.compare_digest(got_pw, pw)
+    return _verify_session_token(_cookie_from_headers(handler, SESSION_COOKIE), user, pw)
 
 
-def _require_auth(handler: "Handler", env: dict[str, str]) -> bool:
-    if _check_basic_auth(handler, env):
-        return True
-    body = b"Unauthorized"
+def _json_unauthorized(handler: "Handler") -> None:
+    body = json.dumps({"ok": False, "error": "unauthorized"}, ensure_ascii=False).encode("utf-8")
     handler.send_response(401)
-    handler.send_header("WWW-Authenticate", 'Basic realm="Zhuimi Monitor"')
-    handler.send_header("Content-Type", "text/plain; charset=utf-8")
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
     handler.wfile.write(body)
-    return False
 
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+
+
+def _login_html(error: bool = False) -> bytes:
+    html = (STATIC_DIR / "login.html").read_text(encoding="utf-8")
+    err = '<div class="banner err" id="loginError">账号或密码不对</div>' if error else ""
+    return html.replace("<!--ERROR-->", err).encode("utf-8")
 FILTER_PATH = APP_DIR / "client_filter.json"
 ENV_PATH = Path(
     os.environ.get(
@@ -781,16 +836,81 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self._send(code, body, "application/json; charset=utf-8")
 
+    def _redirect(self, location: str, cookie: str | None = None) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _secure_cookie(self) -> bool:
+        return (self.headers.get("X-Forwarded-Proto") or "").lower() == "https"
+
+    def do_POST(self) -> None:  # noqa: N802
+        env = load_env(ENV_PATH)
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/logout" or path == "/logout/":
+            self._redirect("/", _session_cookie("", self._secure_cookie(), clear=True))
+            return
+        if path != "/login":
+            self._json(405, {"ok": False, "error": "method not allowed"})
+            return
+        creds = _dashboard_creds(env)
+        if creds is None:
+            self._redirect("/")
+            return
+        user, pw = creds
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length) if length > 0 else b""
+        form = parse_qs(raw.decode("utf-8", errors="replace"))
+        got_user = (form.get("username") or [""])[0]
+        got_pw = (form.get("password") or [""])[0]
+        if (
+            len(got_user) == len(user)
+            and len(got_pw) == len(pw)
+            and hmac.compare_digest(got_user, user)
+            and hmac.compare_digest(got_pw, pw)
+        ):
+            token = _make_session_token(user, pw)
+            self._redirect("/", _session_cookie(token, self._secure_cookie()))
+            return
+        self._send(200, _login_html(True), "text/html; charset=utf-8")
+
     def do_GET(self) -> None:  # noqa: N802
         env = load_env(ENV_PATH)
-        if not _require_auth(self, env):
-            return
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        if path == "/logout" or path == "/logout/":
+            self._redirect("/", _session_cookie("", self._secure_cookie(), clear=True))
+            return
+        if path == "/login":
+            self._send(200, _login_html(False), "text/html; charset=utf-8")
+            return
+        if path == "/api/health":
+            self._json(200, {"ok": True, "ts": int(time.time())})
+            return
+        if path == "/api/session":
+            if not _is_authed(self, env):
+                _json_unauthorized(self)
+                return
+            self._json(200, {"ok": True})
+            return
+
+        authed = _is_authed(self, env)
+        if not authed:
+            if path.startswith("/api/"):
+                _json_unauthorized(self)
+                return
+            self._send(200, _login_html(False), "text/html; charset=utf-8")
+            return
+
         try:
-            if path == "/" or path == "/index.html":
+            if path == "/" or path == "/index.html" or path == "/app.html":
                 html = (STATIC_DIR / "index.html").read_bytes()
                 self._send(200, html, "text/html; charset=utf-8")
                 return

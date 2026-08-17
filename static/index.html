@@ -423,6 +423,7 @@
         <span id="windowText">近 3 天</span>
         <span id="genText"></span>
         <button class="btn" id="refreshBtn" type="button">立即刷新</button>
+        <a class="btn" id="logoutLink" href="/logout">退出</a>
       </div>
     </header>
 
@@ -658,11 +659,18 @@
       try {
         const q = refresh ? "?refresh=1" : "";
         const [ovSettled, balSettled] = await Promise.allSettled([
-          fetch("/api/overview" + q, { cache: "no-store" }).then((res) => res.json()),
-          fetch("/api/balances" + q, { cache: "no-store" }).then((res) => res.json()),
+          fetch("/api/overview" + q, { cache: "no-store", credentials: "same-origin" }).then((res) => {
+            if (res.status === 401) { location.replace("/"); throw new Error("unauthorized"); }
+            return res.json();
+          }),
+          fetch("/api/balances" + q, { cache: "no-store", credentials: "same-origin" }).then((res) => {
+            if (res.status === 401) { location.replace("/"); throw new Error("unauthorized"); }
+            return res.json();
+          }),
         ]);
         if (ovSettled.status !== "fulfilled") throw ovSettled.reason || new Error("加载失败");
         const data = ovSettled.value;
+        if (data && data.error === "unauthorized") { location.replace("/"); return; }
         if (!data.ok) throw new Error(data.error || "加载失败");
         let balances = { aipdd: { configured: false }, volces: { configured: false } };
         if (balSettled.status === "fulfilled" && balSettled.value && balSettled.value.ok) {
