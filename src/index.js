@@ -45,14 +45,15 @@ function envOf(runtime, key, fallback) {
   return String(raw).trim();
 }
 
-function json(status, obj) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-    },
-  });
+function json(status, obj, extraHeaders) {
+  const headers = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  };
+  if (extraHeaders) {
+    for (const [k, v] of Object.entries(extraHeaders)) headers[k] = v;
+  }
+  return new Response(JSON.stringify(obj), { status, headers });
 }
 
 const SESSION_COOKIE = "zm_sid";
@@ -174,12 +175,14 @@ function renderLoginPage(error) {
     "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\" /><title>追觅客户监控</title></head>" +
     "<body><h1>追觅客户监控</h1>" +
     err +
-    "<form method=\"post\" action=\"/login\">" +
+    "<form id=\"loginForm\" method=\"post\" action=\"/api/login\">" +
     "<label for=\"username\">用户名</label>" +
     "<input type=\"text\" name=\"username\" id=\"username\" autocomplete=\"username\" required />" +
     "<label for=\"password\">密码</label>" +
     "<input type=\"password\" name=\"password\" id=\"password\" autocomplete=\"current-password\" required />" +
-    "<button type=\"submit\">登录</button></form></body></html>"
+    "<button type=\"submit\">登录</button></form>" +
+    "<script>(function(){var f=document.getElementById(\"loginForm\");if(!f)return;f.addEventListener(\"submit\",function(e){e.preventDefault();var u=document.getElementById(\"username\").value;var p=document.getElementById(\"password\").value;fetch(\"/api/login\",{method:\"POST\",credentials:\"same-origin\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({username:u,password:p})}).then(function(r){if(r.ok)location.replace(\"/app.html\");});});})();</script>" +
+    "</body></html>"
   );
 }
 
@@ -190,6 +193,17 @@ function renderAppPage() {
 
 async function readLoginForm(request) {
   const ctype = request.headers.get("Content-Type") || "";
+  if (ctype.includes("application/json")) {
+    try {
+      const body = JSON.parse(await request.text());
+      return {
+        username: String((body && body.username) || ""),
+        password: String((body && body.password) || ""),
+      };
+    } catch {
+      return { username: "", password: "" };
+    }
+  }
   if (ctype.includes("multipart/form-data") && request.formData) {
     const fd = await request.formData();
     return {
@@ -203,6 +217,47 @@ async function readLoginForm(request) {
     username: String(params.get("username") || ""),
     password: String(params.get("password") || ""),
   };
+}
+
+async function handleCredentialLogin(request, user, password, jsonMode) {
+  if (!password) {
+    if (jsonMode) return json(200, { ok: true });
+    return new Response(null, { status: 302, headers: { Location: "/", "Cache-Control": "no-store" } });
+  }
+  const form = await readLoginForm(request);
+  const ok = safeEqual(form.username, user) && safeEqual(form.password, password);
+  if (!ok) {
+    if (jsonMode) return json(401, { ok: false, error: "账号或密码不对" });
+    return htmlPage(200, renderLoginPage(true));
+  }
+  const token = await makeSessionToken(user, password, Date.now());
+  const cookie = sessionCookieValue(token, request.url, false);
+  if (jsonMode) {
+    return json(200, { ok: true }, { "Set-Cookie": cookie });
+  }
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: "/",
+      "Set-Cookie": cookie,
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+function handleLogoutResponse(request, jsonMode) {
+  const cookie = sessionCookieValue("", request.url, true);
+  if (jsonMode) {
+    return json(200, { ok: true }, { "Set-Cookie": cookie });
+  }
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: "/",
+      "Set-Cookie": cookie,
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
 function shanghaiParts(date) {
@@ -967,35 +1022,15 @@ export default {
     const path = url.pathname;
 
     try {
-      if (path === "/login" && request.method === "POST") {
-        if (!password) {
-          return new Response(null, { status: 302, headers: { Location: "/", "Cache-Control": "no-store" } });
-        }
-        const form = await readLoginForm(request);
-        const ok = safeEqual(form.username, user) && safeEqual(form.password, password);
-        if (!ok) {
-          return htmlPage(200, renderLoginPage(true));
-        }
-        const token = await makeSessionToken(user, password, Date.now());
-        return new Response(null, {
-          status: 302,
-          headers: {
-            Location: "/",
-            "Set-Cookie": sessionCookieValue(token, request.url, false),
-            "Cache-Control": "no-store",
-          },
-        });
+      if ((path === "/api/login" || path === "/login") && request.method === "POST") {
+        return handleCredentialLogin(request, user, password, path === "/api/login");
       }
 
-      if ((path === "/logout" || path === "/logout/") && (request.method === "GET" || request.method === "POST")) {
-        return new Response(null, {
-          status: 302,
-          headers: {
-            Location: "/",
-            "Set-Cookie": sessionCookieValue("", request.url, true),
-            "Cache-Control": "no-store",
-          },
-        });
+      if (
+        (path === "/api/logout" || path === "/api/logout/" || path === "/logout" || path === "/logout/") &&
+        (request.method === "GET" || request.method === "POST")
+      ) {
+        return handleLogoutResponse(request, path.startsWith("/api/") && request.method === "POST");
       }
 
       if (path === "/login" && request.method === "GET") {

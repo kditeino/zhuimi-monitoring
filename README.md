@@ -31,7 +31,7 @@ ESA 构建信息里的环境变量会在 `npm run build` 时打进边缘函数�
 
 ESA 构建环境变量还要加上 `AIPDD_BASE_URL`、`AIPDD_API_KEY`、`VOLC_ACCESS_KEY_ID`、`VOLC_SECRET_ACCESS_KEY`（只加名字，不要写真实值），加完后重新构建。
 
-登录已改成网页表单，账号密码仍是 `DASHBOARD_USER` / `DASHBOARD_PASSWORD`。浏览器不再弹出 Basic Auth 窗口，密码管理器可以记住这两个输入框。
+登录已改成网页表单，账号密码仍是 `DASHBOARD_USER` / `DASHBOARD_PASSWORD`。浏览器不再弹出 Basic Auth 窗口，密码管理器可以记住这两个输入框。提交用 `fetch("/api/login")`，不要对 `/login` 做浏览器原生 POST（ESA 静态资源 / OSS 会拦截并返回 XML）。
 
 ### 重建步骤
 
@@ -97,8 +97,9 @@ python3 render_report.py --period evening
 | 路径 | 说明 |
 |------|------|
 | `GET /` | 未登录为网页登录表单；已登录后进入看板（ESA 静态登录页 + `/app.html`） |
-| `POST /login` | 校验看板账号，写入 HttpOnly 会话 cookie，302 到 `/` |
-| `GET /logout` | 清除会话 cookie 并回到登录页 |
+| `POST /api/login` | 校验看板账号，写入 HttpOnly 会话 cookie，返回 JSON（页面用 fetch，避免 ESA/OSS 拦截 `POST /login`） |
+| `POST /api/logout` | 清除会话 cookie，返回 JSON；`GET /api/logout` 302 回登录页 |
+| `POST /login` / `GET /logout` | Worker 兜底，页面不再使用（静态路径 POST 会被 OSS 吃掉） |
 | `GET /app.html` | H5 看板 |
 | `GET /api/session` | 会话是否有效（未登录 JSON 401，不带 Basic 弹窗） |
 | `GET /api/overview` | 指标 + 近 3 天日志（`?refresh=1` 跳过缓存） |
