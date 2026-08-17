@@ -423,7 +423,7 @@
         <span id="windowText">近 3 天</span>
         <span id="genText"></span>
         <button class="btn" id="refreshBtn" type="button">立即刷新</button>
-        <a class="btn" id="logoutLink" href="/logout">退出</a>
+        <a class="btn" id="logoutLink" href="/api/logout">退出</a>
       </div>
     </header>
 
@@ -707,6 +707,12 @@
     }
 
     document.getElementById("refreshBtn").addEventListener("click", () => load(true));
+    document.getElementById("logoutLink").addEventListener("click", (e) => {
+      e.preventDefault();
+      fetch("/api/logout", { method: "POST", credentials: "same-origin" })
+        .catch(() => {})
+        .finally(() => location.replace("/"));
+    });
     setInterval(() => load(true), 600000);
     load(false);
   </script>

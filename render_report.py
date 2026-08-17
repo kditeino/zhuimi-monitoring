@@ -51,8 +51,9 @@ def _session_cookie() -> str:
     user, pw = _dashboard_creds()
     if not pw:
         return ""
-    data = urllib.parse.urlencode({"username": user, "password": pw}).encode()
-    req = urllib.request.Request(f"{BASE}/login", data=data, method="POST")
+    data = json.dumps({"username": user, "password": pw}).encode()
+    req = urllib.request.Request(f"{BASE}/api/login", data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
     try:
         with _opener().open(req, timeout=30) as resp:
             return (resp.headers.get("Set-Cookie") or "").split(";", 1)[0]

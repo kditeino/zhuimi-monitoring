@@ -832,9 +832,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, code: int, obj: Any) -> None:
+    def _json(self, code: int, obj: Any, cookie: str | None = None) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self._send(code, body, "application/json; charset=utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_login_creds(self) -> tuple[str, str]:
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length) if length > 0 else b""
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        if "application/json" in ctype:
+            try:
+                obj = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except json.JSONDecodeError:
+                obj = {}
+            if not isinstance(obj, dict):
+                obj = {}
+            return str(obj.get("username") or ""), str(obj.get("password") or "")
+        form = parse_qs(raw.decode("utf-8", errors="replace"))
+        return (form.get("username") or [""])[0], (form.get("password") or [""])[0]
 
     def _redirect(self, location: str, cookie: str | None = None) -> None:
         self.send_response(302)
@@ -852,22 +874,26 @@ class Handler(BaseHTTPRequestHandler):
         env = load_env(ENV_PATH)
         parsed = urlparse(self.path)
         path = parsed.path
-        if path == "/logout" or path == "/logout/":
-            self._redirect("/", _session_cookie("", self._secure_cookie(), clear=True))
+        if path in ("/logout", "/logout/", "/api/logout", "/api/logout/"):
+            cookie = _session_cookie("", self._secure_cookie(), clear=True)
+            if path.startswith("/api/"):
+                self._json(200, {"ok": True}, cookie)
+                return
+            self._redirect("/", cookie)
             return
-        if path != "/login":
+        if path not in ("/login", "/api/login"):
             self._json(405, {"ok": False, "error": "method not allowed"})
             return
+        json_mode = path == "/api/login"
         creds = _dashboard_creds(env)
         if creds is None:
-            self._redirect("/")
+            if json_mode:
+                self._json(200, {"ok": True})
+            else:
+                self._redirect("/")
             return
         user, pw = creds
-        length = int(self.headers.get("Content-Length") or "0")
-        raw = self.rfile.read(length) if length > 0 else b""
-        form = parse_qs(raw.decode("utf-8", errors="replace"))
-        got_user = (form.get("username") or [""])[0]
-        got_pw = (form.get("password") or [""])[0]
+        got_user, got_pw = self._read_login_creds()
         if (
             len(got_user) == len(user)
             and len(got_pw) == len(pw)
@@ -875,7 +901,14 @@ class Handler(BaseHTTPRequestHandler):
             and hmac.compare_digest(got_pw, pw)
         ):
             token = _make_session_token(user, pw)
-            self._redirect("/", _session_cookie(token, self._secure_cookie()))
+            cookie = _session_cookie(token, self._secure_cookie())
+            if json_mode:
+                self._json(200, {"ok": True}, cookie)
+            else:
+                self._redirect("/", cookie)
+            return
+        if json_mode:
+            self._json(401, {"ok": False, "error": "账号或密码不对"})
             return
         self._send(200, _login_html(True), "text/html; charset=utf-8")
 
@@ -885,7 +918,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
 
-        if path == "/logout" or path == "/logout/":
+        if path in ("/logout", "/logout/", "/api/logout", "/api/logout/"):
             self._redirect("/", _session_cookie("", self._secure_cookie(), clear=True))
             return
         if path == "/login":
