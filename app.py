@@ -521,7 +521,9 @@ def build_report(env: dict[str, str], hours: int | None = None, period: str | No
 
 
 AIPDD_DEFAULT_BASE = "https://api.aipdd.work"
-AIPDD_WALLET_PATHS = ["/v1/user", "/v1/wallet", "/v1/account", "/v1/balance", "/api/user/self"]
+AIPDD_USER_INFO_PATH = "/user/info"
+# CNY = availableBalance * 0.0001. Matches public GET /system/awcoin-rate
+# data.rmb (confirmed live 0.0001). Do not fetch the rate at runtime.
 DEFAULT_AWCOIN_RMB = 0.0001
 VOLC_BILLING_HOST = "billing.volcengineapi.com"
 VOLC_BILLING_SERVICE = "billing"
@@ -570,7 +572,12 @@ def _looks_like_newapi_quota(obj: Any) -> bool:
     if not isinstance(obj, dict):
         return False
     has_quota = obj.get("quota") is not None and obj.get("used_quota") is not None
-    has_awcoin = obj.get("awcoin") is not None or obj.get("awCoin") is not None or obj.get("aw_coin") is not None
+    has_awcoin = (
+        obj.get("availableBalance") is not None
+        or obj.get("awcoin") is not None
+        or obj.get("awCoin") is not None
+        or obj.get("aw_coin") is not None
+    )
     return has_quota and not has_awcoin
 
 
@@ -578,6 +585,7 @@ def _pick_awcoin(obj: Any) -> float | None:
     if not isinstance(obj, dict) or _looks_like_rate(obj) or _looks_like_newapi_quota(obj):
         return None
     for key in (
+        "availableBalance",
         "awcoin",
         "awCoin",
         "AWCoin",
@@ -585,7 +593,6 @@ def _pick_awcoin(obj: Any) -> float | None:
         "awcoin_balance",
         "wallet_balance",
         "available_balance",
-        "availableBalance",
         "remain_awcoin",
         "balance",
         "wallet",
@@ -625,6 +632,35 @@ def _extract_awcoin(payload: Any) -> float | None:
             if found is not None:
                 return found
     return _pick_awcoin(payload)
+
+
+def _extract_frozen_balance(payload: Any) -> float | None:
+    data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return None
+    return _as_finite_number(data.get("frozenBalance"))
+
+
+def _aipdd_fail_from_http(status: int | None) -> str:
+    if status in (401, 403):
+        return "AIPDD 钥匙无效"
+    return "AIPDD 余额查询失败"
+
+
+def _fetch_aipdd_user_info(base: str, key: str) -> dict[str, Any]:
+    try:
+        payload = _aipdd_get(base, key, AIPDD_USER_INFO_PATH)
+    except urllib.error.HTTPError as exc:
+        return {"awcoin": None, "frozen": None, "error": _aipdd_fail_from_http(exc.code)}
+    except Exception:
+        return {"awcoin": None, "frozen": None, "error": "AIPDD 余额查询失败"}
+    if isinstance(payload, dict) and payload.get("code") in (401, 403):
+        return {"awcoin": None, "frozen": None, "error": "AIPDD 钥匙无效"}
+    awcoin = _extract_awcoin(payload)
+    frozen = _extract_frozen_balance(payload)
+    if awcoin is None:
+        return {"awcoin": None, "frozen": frozen, "error": "AIPDD 余额解析失败"}
+    return {"awcoin": awcoin, "frozen": frozen, "error": None}
 
 
 def _aipdd_get(base: str, key: str, path: str) -> dict[str, Any]:
@@ -753,41 +789,25 @@ def build_balances(env: dict[str, str], force: bool = False) -> dict[str, Any]:
         out["cached"] = True
         return out
 
-    rmb = DEFAULT_AWCOIN_RMB
-    usd_rate = None
     if aipdd_key:
-        try:
-            rate_payload = _aipdd_get(base, aipdd_key, "/system/awcoin-rate")
-            data = rate_payload.get("data") if isinstance(rate_payload.get("data"), dict) else {}
-            rmb = _as_finite_number(data.get("rmb")) or DEFAULT_AWCOIN_RMB
-            usd_rate = _as_finite_number(data.get("usd"))
-        except Exception:
-            rmb = DEFAULT_AWCOIN_RMB
-
-    if aipdd_key:
-        awcoin = None
-        for path in AIPDD_WALLET_PATHS:
-            try:
-                payload = _aipdd_get(base, aipdd_key, path)
-                awcoin = _extract_awcoin(payload)
-                if awcoin is not None:
-                    break
-            except Exception:
-                continue
-        if awcoin is None:
+        wallet = _fetch_aipdd_user_info(base, aipdd_key)
+        if wallet.get("error") or wallet.get("awcoin") is None:
             aipdd = {
                 "configured": True,
                 "cny": None,
                 "usd": None,
                 "awcoin": None,
-                "error": "AIPDD 余额查询失败",
+                "frozenBalance": wallet.get("frozen"),
+                "error": wallet.get("error") or "AIPDD 余额查询失败",
             }
         else:
+            awcoin = wallet["awcoin"]
             aipdd = {
                 "configured": True,
-                "cny": round(awcoin * rmb, 4),
-                "usd": round(awcoin * usd_rate, 6) if usd_rate else None,
+                "cny": round(awcoin * DEFAULT_AWCOIN_RMB, 4),
+                "usd": None,
                 "awcoin": awcoin,
+                "frozenBalance": wallet.get("frozen"),
                 "error": None,
             }
     else:

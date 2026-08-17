@@ -16,23 +16,18 @@ const TZ = "Asia/Shanghai";
 
 let cache = { ts: 0, status: null, logs: null };
 let balancesCache = { ts: 0, payload: null };
-let aipddWalletPath = "";
-let aipddFailedPaths = [];
-let awcoinRateCache = { ts: 0, rmb: 0.0001, usd: 0.00001484 };
 
 const AIPDD_DEFAULT_BASE = "https://api.aipdd.work";
-const AIPDD_RATE_PATH = "/system/awcoin-rate";
+const AIPDD_USER_INFO_PATH = "/user/info";
+// CNY = availableBalance * 0.0001. Matches public GET /system/awcoin-rate
+// data.rmb (confirmed live 0.0001). Do not fetch the rate at runtime —
+// ESA allows ~4 outbound subrequests per invocation; keep the spare slot
+// for Volcengine QueryBalanceAcct.
 const DEFAULT_AWCOIN_RMB = 0.0001;
-// Probe order on official AIPDD (AWCoin). Unauthenticated GETs to all five
-// return AIPDD-style 401 {code,message,data}, so they exist. Runtime caches
-// the first path that yields a usable AWCoin balance. Do not call
-// newapi.aipdd.work (ImpToken) or susciyuan /api/user/self here.
-const AIPDD_WALLET_PATHS = ["/v1/user", "/v1/wallet", "/v1/account", "/v1/balance", "/api/user/self"];
 const VOLC_BILLING_HOST = "billing.volcengineapi.com";
 const VOLC_BILLING_SERVICE = "billing";
 const VOLC_BILLING_REGION = "cn-north-1";
 const VOLC_CONTENT_TYPE = "application/x-www-form-urlencoded";
-const RATE_CACHE_TTL_MS = 60 * 60 * 1000;
 const MAX_BALANCES_SUBREQ = 4;
 
 function envOf(runtime, key, fallback) {
@@ -330,7 +325,11 @@ function looksLikeRatePayload(obj) {
 function looksLikeNewApiQuota(obj) {
   if (!obj || typeof obj !== "object") return false;
   const hasQuota = obj.quota != null && obj.used_quota != null;
-  const hasAwcoin = obj.awcoin != null || obj.awCoin != null || obj.aw_coin != null;
+  const hasAwcoin =
+    obj.availableBalance != null ||
+    obj.awcoin != null ||
+    obj.awCoin != null ||
+    obj.aw_coin != null;
   return hasQuota && !hasAwcoin;
 }
 
@@ -338,6 +337,7 @@ function pickAwcoinFromObject(obj) {
   if (!obj || typeof obj !== "object") return null;
   if (looksLikeRatePayload(obj) || looksLikeNewApiQuota(obj)) return null;
   const preferred = [
+    "availableBalance",
     "awcoin",
     "awCoin",
     "AWCoin",
@@ -345,7 +345,6 @@ function pickAwcoinFromObject(obj) {
     "awcoin_balance",
     "wallet_balance",
     "available_balance",
-    "availableBalance",
     "remain_awcoin",
     "balance",
     "wallet",
@@ -389,6 +388,11 @@ function extractAwcoinRate(payload) {
     rmb: rmb != null && rmb > 0 ? rmb : DEFAULT_AWCOIN_RMB,
     usd: usd != null && usd > 0 ? usd : null,
   };
+}
+
+function extractFrozenBalance(payload) {
+  const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+  return asFiniteNumber(data && data.frozenBalance);
 }
 
 function parseVolcBalance(payload) {
@@ -758,9 +762,6 @@ function emptyVolces(error) {
 
 function resetBalancesState() {
   balancesCache = { ts: 0, payload: null };
-  aipddWalletPath = "";
-  aipddFailedPaths = [];
-  awcoinRateCache = { ts: 0, rmb: DEFAULT_AWCOIN_RMB, usd: 0.00001484 };
 }
 
 function assertAipddHost(url) {
@@ -788,6 +789,7 @@ async function aipddGetJson(base, key, path) {
   if (!res.ok || (res.status >= 300 && res.status < 400)) {
     const err = new Error("upstream HTTP " + res.status);
     err.status = 502;
+    err.httpStatus = res.status;
     throw err;
   }
   const text = await res.text();
@@ -800,57 +802,26 @@ async function aipddGetJson(base, key, path) {
   }
 }
 
-async function fetchAwcoinRate(base) {
-  const now = Date.now();
-  if (awcoinRateCache.ts && now - awcoinRateCache.ts < RATE_CACHE_TTL_MS) {
-    return { rmb: awcoinRateCache.rmb, usd: awcoinRateCache.usd, cached: true };
-  }
-  const root = base.endsWith("/") ? base : base + "/";
-  const url = new URL(AIPDD_RATE_PATH, root);
-  assertAipddHost(url.hostname);
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    redirect: "manual",
-    headers: { Accept: "application/json" },
-  });
-  if (!res.ok) {
-    return { rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: false };
-  }
-  const payload = JSON.parse(await res.text());
-  const rate = extractAwcoinRate(payload);
-  awcoinRateCache = { ts: Date.now(), rmb: rate.rmb, usd: rate.usd };
-  return { rmb: rate.rmb, usd: rate.usd, cached: false };
+function aipddFailFromHttp(httpStatus) {
+  if (httpStatus === 401 || httpStatus === 403) return "AIPDD 钥匙无效";
+  return "AIPDD 余额查询失败";
 }
 
-async function probeAipddWallet(base, key, budget) {
-  const tried = [];
-  const paths = [];
-  if (aipddWalletPath && aipddFailedPaths.indexOf(aipddWalletPath) < 0) paths.push(aipddWalletPath);
-  for (let i = 0; i < AIPDD_WALLET_PATHS.length; i++) {
-    const p = AIPDD_WALLET_PATHS[i];
-    if (paths.indexOf(p) < 0 && aipddFailedPaths.indexOf(p) < 0) paths.push(p);
-  }
-  if (!paths.length) {
-    aipddFailedPaths = [];
-    paths.push.apply(paths, AIPDD_WALLET_PATHS);
-  }
-  const limit = Math.max(1, Math.min(budget, paths.length));
-  for (let i = 0; i < limit; i++) {
-    const path = paths[i];
-    tried.push(path);
-    try {
-      const payload = await aipddGetJson(base, key, path);
-      const awcoin = extractAwcoin(payload);
-      if (awcoin != null) {
-        aipddWalletPath = path;
-        return { awcoin: awcoin, path: path, tried: tried };
-      }
-    } catch {
-      // try next documented path; never surface upstream text
+async function fetchAipddUserInfo(base, key) {
+  try {
+    const payload = await aipddGetJson(base, key, AIPDD_USER_INFO_PATH);
+    if (payload && (Number(payload.code) === 401 || Number(payload.code) === 403)) {
+      return { awcoin: null, frozen: null, error: "AIPDD 钥匙无效" };
     }
-    if (aipddFailedPaths.indexOf(path) < 0) aipddFailedPaths.push(path);
+    const awcoin = extractAwcoin(payload);
+    const frozen = extractFrozenBalance(payload);
+    if (awcoin == null) {
+      return { awcoin: null, frozen: frozen, error: "AIPDD 余额解析失败" };
+    }
+    return { awcoin: awcoin, frozen: frozen, error: null };
+  } catch (err) {
+    return { awcoin: null, frozen: null, error: aipddFailFromHttp(err && err.httpStatus) };
   }
-  return { awcoin: null, path: "", tried: tried };
 }
 
 async function fetchVolcBalance(ak, sk, now) {
@@ -926,11 +897,10 @@ async function handleBalances(request, runtime) {
   }
 
   let used = 0;
-  let rateP = Promise.resolve({ rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: true });
   let aipddP = Promise.resolve(null);
   let volcP = Promise.resolve(null);
 
-  if (volcReady) {
+  if (volcReady && used < MAX_BALANCES_SUBREQ) {
     used += 1;
     volcP = fetchVolcBalance(volcAk, volcSk, new Date()).then(
       function (cny) {
@@ -942,33 +912,37 @@ async function handleBalances(request, runtime) {
     );
   }
 
-  if (aipddReady) {
-    const rateFresh = awcoinRateCache.ts && now - awcoinRateCache.ts < RATE_CACHE_TTL_MS;
-    if (!rateFresh && used < MAX_BALANCES_SUBREQ) {
-      used += 1;
-      rateP = fetchAwcoinRate(base).catch(function () {
-        return { rmb: DEFAULT_AWCOIN_RMB, usd: awcoinRateCache.usd, cached: false };
-      });
-    }
-    const walletBudget = Math.max(1, MAX_BALANCES_SUBREQ - used);
-    aipddP = probeAipddWallet(base, aipddKey, walletBudget);
+  if (aipddReady && used < MAX_BALANCES_SUBREQ) {
+    used += 1;
+    aipddP = fetchAipddUserInfo(base, aipddKey);
   }
 
-  const settled = await Promise.all([rateP, aipddP, volcP]);
-  const rate = settled[0] || { rmb: DEFAULT_AWCOIN_RMB, usd: null };
-  const wallet = settled[1];
-  const volcRes = settled[2];
+  const settled = await Promise.all([aipddP, volcP]);
+  const wallet = settled[0];
+  const volcRes = settled[1];
 
   let aipdd;
   if (!aipddReady) {
     aipdd = emptyAipdd("未配置 AIPDD_API_KEY");
-  } else if (!wallet || wallet.awcoin == null) {
-    aipdd = { configured: true, cny: null, usd: null, awcoin: null, error: "AIPDD 余额查询失败" };
+  } else if (!wallet || wallet.error || wallet.awcoin == null) {
+    aipdd = {
+      configured: true,
+      cny: null,
+      usd: null,
+      awcoin: null,
+      frozenBalance: wallet && wallet.frozen != null ? wallet.frozen : null,
+      error: (wallet && wallet.error) || "AIPDD 余额查询失败",
+    };
   } else {
-    const rmb = rate.rmb > 0 ? rate.rmb : DEFAULT_AWCOIN_RMB;
-    const cny = roundN(wallet.awcoin * rmb, 4);
-    const usd = rate.usd != null ? roundN(wallet.awcoin * rate.usd, 6) : null;
-    aipdd = { configured: true, cny: cny, usd: usd, awcoin: wallet.awcoin, error: null };
+    const cny = roundN(wallet.awcoin * DEFAULT_AWCOIN_RMB, 4);
+    aipdd = {
+      configured: true,
+      cny: cny,
+      usd: null,
+      awcoin: wallet.awcoin,
+      frozenBalance: wallet.frozen,
+      error: null,
+    };
   }
 
   let volces;
