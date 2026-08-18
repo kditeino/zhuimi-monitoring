@@ -875,6 +875,33 @@
       }
     }
 
+    async function fetchJson(path) {
+      const res = await fetch(path, { cache: "no-store", credentials: "same-origin" });
+      if (res.status === 401) { location.replace("/"); throw new Error("unauthorized"); }
+      const text = await res.text();
+      const look = (text || "").trim();
+      const ctype = (res.headers.get("content-type") || "").toLowerCase();
+      if (!look || look.charAt(0) === "<" || ctype.indexOf("html") >= 0) {
+        if (res.status === 504 || res.status === 502 || res.status === 503) {
+          const err = new Error("看板接口超时");
+          err.retryable = true;
+          throw err;
+        }
+        const err = new Error("看板接口返回了网页而不是数据");
+        err.retryable = true;
+        throw err;
+      }
+      let data;
+      try { data = JSON.parse(text); }
+      catch (e) {
+        const err = new Error("看板接口不是 JSON");
+        err.retryable = true;
+        throw err;
+      }
+      if (data && data.error === "unauthorized") { location.replace("/"); throw new Error("unauthorized"); }
+      return data;
+    }
+
     async function load(refresh) {
       const errBox = document.getElementById("errorBox");
       const loading = document.getElementById("loading");
@@ -887,16 +914,22 @@
       try {
         hydrateWalletHistory();
         const q = refresh ? "?refresh=1" : "";
-        const [ovSettled, balSettled] = await Promise.allSettled([
-          fetch("/api/overview" + q, { cache: "no-store", credentials: "same-origin" }).then((res) => {
-            if (res.status === 401) { location.replace("/"); throw new Error("unauthorized"); }
-            return res.json();
-          }),
-          fetch("/api/balances" + q, { cache: "no-store", credentials: "same-origin" }).then((res) => {
-            if (res.status === 401) { location.replace("/"); throw new Error("unauthorized"); }
-            return res.json();
-          }),
-        ]);
+        async function once() {
+          return Promise.allSettled([
+            fetchJson("/api/overview" + q),
+            fetchJson("/api/balances" + q),
+          ]);
+        }
+        let [ovSettled, balSettled] = await once();
+        if (ovSettled.status !== "fulfilled") {
+          const reason = ovSettled.reason || {};
+          if (reason.retryable !== false) {
+            await new Promise(function (r) { setTimeout(r, 900); });
+            const again = await once();
+            ovSettled = again[0];
+            if (again[1].status === "fulfilled") balSettled = again[1];
+          }
+        }
         if (ovSettled.status !== "fulfilled") throw ovSettled.reason || new Error("加载失败");
         const data = ovSettled.value;
         if (data && data.error === "unauthorized") { location.replace("/"); return; }
