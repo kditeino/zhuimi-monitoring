@@ -259,6 +259,8 @@
     .card .hint { color: var(--muted); font-size: 11px; margin-top: 5px; }
     .card.money .value { color: var(--money); }
     .card.error .value { color: var(--error); }
+    .card.warn .value { color: var(--error); }
+    .card.warn { border-color: var(--badge-error-bd); }
     .chips, .models {
       display: flex; flex-wrap: wrap; gap: 6px;
       margin: 0 0 14px;
@@ -501,6 +503,227 @@
       return "¥" + Number(n || 0).toFixed(2);
     }
 
+    const WALLET_HIST_KEY = "zhuimi-wallet-history";
+    const WALLET_COOKIE = "zm_wh";
+    const MIN_SPAN_HOURS = 2;
+    const HISTORY_KEEP_SECS = 3 * 86400;
+    const MAX_HISTORY = 200;
+    const SEED_MAX_AGE = 36 * 3600;
+    const WALLET_SEED = [
+      {ts:1787056427,aipdd:127.4249,seedance:798.96},
+      {ts:1787058075,aipdd:125.8959,seedance:797.3},
+      {ts:1787060117,aipdd:125.1559,seedance:790.97},
+      {ts:1787061782,aipdd:122.1959,seedance:783.98},
+      {ts:1787067231,aipdd:122.1959,seedance:781.66}
+    ];
+
+    function parseHistNum(raw) {
+      if (raw == null) return null;
+      const s = String(raw).trim();
+      if (!s) return null;
+      const n = Number(s);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function decodeWalletHistory(raw) {
+      let text = String(raw || "").trim();
+      if (!text) return [];
+      try { text = decodeURIComponent(text); } catch (e) {}
+      if (text.startsWith("v1.")) text = text.slice(3);
+      const out = [];
+      text.split(";").forEach(function (piece) {
+        piece = piece.trim();
+        if (!piece) return;
+        const bits = piece.split(",");
+        const ts = Number(bits[0]);
+        if (!Number.isFinite(ts)) return;
+        out.push({ ts: ts, aipdd: parseHistNum(bits[1]), seedance: parseHistNum(bits[2]) });
+      });
+      return out;
+    }
+
+    function encodeWalletHistory(hist) {
+      return "v1." + (hist || []).map(function (h) {
+        const a = h.aipdd == null || !Number.isFinite(Number(h.aipdd)) ? "" : String(h.aipdd);
+        const s = h.seedance == null || !Number.isFinite(Number(h.seedance)) ? "" : String(h.seedance);
+        return String(h.ts) + "," + a + "," + s;
+      }).join(";");
+    }
+
+    function mergeWalletHistoryLists() {
+      const now = Date.now() / 1000;
+      const byTs = {};
+      function add(list) {
+        (list || []).forEach(function (h) {
+          if (!h) return;
+          const ts = Number(h.ts);
+          if (!Number.isFinite(ts)) return;
+          const prev = byTs[ts] || { ts: ts, aipdd: null, seedance: null };
+          byTs[ts] = {
+            ts: ts,
+            aipdd: h.aipdd != null && Number.isFinite(Number(h.aipdd)) ? Number(h.aipdd) : prev.aipdd,
+            seedance: h.seedance != null && Number.isFinite(Number(h.seedance)) ? Number(h.seedance) : prev.seedance
+          };
+        });
+      }
+      let stored = [];
+      try {
+        stored = JSON.parse(localStorage.getItem(WALLET_HIST_KEY) || "[]");
+        if (!Array.isArray(stored)) stored = [];
+      } catch (e) { stored = []; }
+      let cookiePts = [];
+      try {
+        const m = document.cookie.match(/(?:^|;\s*)zm_wh=([^;]*)/);
+        if (m) cookiePts = decodeWalletHistory(m[1]);
+      } catch (e) {}
+      const seed = WALLET_SEED.filter(function (h) { return now - h.ts <= SEED_MAX_AGE; });
+      add(stored);
+      add(cookiePts);
+      add(seed);
+      const cutoff = now - HISTORY_KEEP_SECS;
+      let hist = Object.keys(byTs).map(function (k) { return byTs[k]; })
+        .filter(function (h) { return h.ts >= cutoff && h.ts <= now + 120; })
+        .sort(function (a, b) { return a.ts - b.ts; });
+      if (hist.length > MAX_HISTORY) hist = hist.slice(-MAX_HISTORY);
+      return hist;
+    }
+
+    function saveWalletHistory(hist) {
+      try { localStorage.setItem(WALLET_HIST_KEY, JSON.stringify(hist)); } catch (e) {}
+      try {
+        const compact = encodeWalletHistory(hist);
+        const secure = location.protocol === "https:" ? "; Secure" : "";
+        document.cookie = WALLET_COOKIE + "=" + encodeURIComponent(compact) +
+          "; Path=/; Max-Age=" + (3 * 86400) + "; SameSite=Lax" + secure;
+      } catch (e) {}
+    }
+
+    function appendWalletSnapshot(hist, nowSec, aipddCny, seedCny) {
+      const list = (hist || []).slice();
+      const last = list.length ? list[list.length - 1] : null;
+      if (last && Math.abs(Number(last.ts) - nowSec) < 1) {
+        last.aipdd = aipddCny != null ? aipddCny : last.aipdd;
+        last.seedance = seedCny != null ? seedCny : last.seedance;
+        return list;
+      }
+      list.push({ ts: nowSec, aipdd: aipddCny, seedance: seedCny });
+      const cutoff = nowSec - HISTORY_KEEP_SECS;
+      let out = list.filter(function (h) { return Number(h.ts) >= cutoff; });
+      if (out.length > MAX_HISTORY) out = out.slice(-MAX_HISTORY);
+      return out;
+    }
+
+    function estimateRunway(hist, key, nowCny, now) {
+      const empty = { burn_24h: null, days_left: null, sample_hours: 0, reliable: false };
+      if (nowCny == null || !Number.isFinite(Number(nowCny))) return empty;
+      const nowN = Number(nowCny);
+      const points = (hist || []).filter(function (h) {
+        return h && h[key] != null && Number(h.ts || 0) < now;
+      });
+      if (!points.length) return empty;
+      const target = now - 86400;
+      const windowed = points.filter(function (h) {
+        const age = now - Number(h.ts);
+        return age >= 18 * 3600 && age <= 36 * 3600;
+      });
+      let old;
+      if (windowed.length) {
+        old = windowed[0];
+        let best = Math.abs(Number(old.ts) - target);
+        windowed.forEach(function (h) {
+          const d = Math.abs(Number(h.ts) - target);
+          if (d < best) { best = d; old = h; }
+        });
+      } else {
+        old = points[0];
+      }
+      const spanH = (now - Number(old.ts)) / 3600;
+      if (spanH < MIN_SPAN_HOURS) {
+        return { burn_24h: null, days_left: null, sample_hours: Math.round(spanH * 100) / 100, reliable: false };
+      }
+      const burned = Number(old[key]) - nowN;
+      if (burned <= 0.05) {
+        return { burn_24h: 0, days_left: null, sample_hours: Math.round(spanH * 100) / 100, reliable: spanH >= 12 };
+      }
+      const burn24h = burned / spanH * 24;
+      const days = burn24h > 0 ? nowN / burn24h : null;
+      return {
+        burn_24h: Math.round(burn24h * 10000) / 10000,
+        days_left: days != null ? Math.round(days * 100) / 100 : null,
+        sample_hours: Math.round(spanH * 100) / 100,
+        reliable: spanH >= 6
+      };
+    }
+
+    function hydrateWalletHistory() {
+      const hist = mergeWalletHistoryLists();
+      saveWalletHistory(hist);
+      return hist;
+    }
+
+    function finiteCny(row) {
+      if (!row || row.cny == null) return null;
+      const n = Number(row.cny);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function attachClientRunway(balances) {
+      const now = Date.now() / 1000;
+      let hist = hydrateWalletHistory();
+      const a = Object.assign({}, (balances && balances.aipdd) || {});
+      const v = Object.assign({}, (balances && balances.volces) || {});
+      const aCny = finiteCny(a);
+      const sCny = finiteCny(v);
+      hist = appendWalletSnapshot(hist, now, aCny, sCny);
+      saveWalletHistory(hist);
+      function apply(row, key, cny) {
+        if (row.days_left != null || row.burn_24h != null) return row;
+        const run = estimateRunway(hist, key, cny, now);
+        row.days_left = run.days_left;
+        row.burn_24h = run.burn_24h;
+        row.sample_hours = run.sample_hours;
+        row.days_reliable = run.reliable;
+        return row;
+      }
+      return { aipdd: apply(a, "aipdd", aCny), volces: apply(v, "seedance", sCny) };
+    }
+
+    function fmtDays(n) {
+      return (Math.round(Number(n) * 10) / 10).toFixed(1);
+    }
+
+    function fmtBurn(n) {
+      const x = Number(n);
+      if (!Number.isFinite(x)) return "¥0";
+      if (x >= 10) return "¥" + String(Math.round(x));
+      return "¥" + x.toFixed(1);
+    }
+
+    function fmtHours(n) {
+      const x = Number(n) || 0;
+      if (x >= 10) return String(Math.round(x));
+      return (Math.round(x * 10) / 10).toString();
+    }
+
+    function runwayHint(row) {
+      const days = row.days_left;
+      const burn = row.burn_24h;
+      const hours = Number(row.sample_hours || 0);
+      const reliable = !!row.days_reliable;
+      if (burn != null && Number.isFinite(Number(burn)) && Number(burn) <= 0.05) {
+        return "用量很低，暂不估天数";
+      }
+      if (days != null && Number.isFinite(Number(days)) && burn != null && Number(burn) > 0.05) {
+        let s = "还能撑约 " + fmtDays(days) + " 天 · 近24小时消耗 " + fmtBurn(burn);
+        if (!reliable) s += "（采样中）";
+        return s;
+      }
+      if (hours > 0) {
+        return "采样中（已采 " + fmtHours(hours) + " 小时）";
+      }
+      return null;
+    }
+
     function balanceCard(label, item, missingHint) {
       const row = item || {};
       if (!row.configured) {
@@ -509,20 +732,25 @@
       if (row.error || row.cny == null || !Number.isFinite(Number(row.cny))) {
         return { label: label, value: "—", hint: row.error || "查询失败", cls: "money" };
       }
-      let hint = "";
-      if (label.indexOf("火山") >= 0) {
-        hint = "账户可用余额（人民币）";
-      } else if (row.awcoin != null) {
-        hint = String(row.awcoin) + " AWCoin";
-      } else {
-        hint = "官方 AIPDD 钱包";
+      const run = runwayHint(row);
+      let hint = run;
+      if (!hint) {
+        if (label.indexOf("火山") >= 0) {
+          hint = "账户可用余额（人民币）";
+        } else if (row.awcoin != null) {
+          hint = String(row.awcoin) + " AWCoin";
+        } else {
+          hint = "官方 AIPDD 钱包";
+        }
       }
-      return { label: label, value: money(row.cny), hint: hint, cls: "money" };
+      let cls = "money";
+      if (row.days_left != null && Number(row.days_left) <= 2) cls += " warn";
+      return { label: label, value: money(row.cny), hint: hint, cls: cls };
     }
 
     function renderMetrics(m, balances) {
       const errN = Number(m.error_count || 0);
-      const bal = balances || {};
+      const bal = attachClientRunway(balances || {});
       const cards = [
         { label: "用量金额", value: money(m.usage_cny), hint: "配额 " + Math.round(m.usage_quota||0) + " · ≈$" + Number(m.usage_usd||0).toFixed(4), cls: "money" },
         balanceCard("AIPDD剩余金额", bal.aipdd, "尚未配置 AIPDD_API_KEY"),
@@ -657,6 +885,7 @@
       btn.textContent = "刷新中";
       if (app.classList.contains("hidden")) loading.classList.remove("hidden");
       try {
+        hydrateWalletHistory();
         const q = refresh ? "?refresh=1" : "";
         const [ovSettled, balSettled] = await Promise.allSettled([
           fetch("/api/overview" + q, { cache: "no-store", credentials: "same-origin" }).then((res) => {

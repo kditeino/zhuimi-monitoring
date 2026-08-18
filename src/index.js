@@ -16,6 +16,7 @@ const TZ = "Asia/Shanghai";
 
 let cache = { ts: 0, status: null, logs: null };
 let balancesCache = { ts: 0, payload: null };
+let walletHistory = [];
 
 const AIPDD_DEFAULT_BASE = "https://api.aipdd.work";
 const AIPDD_USER_INFO_PATH = "/user/info";
@@ -762,6 +763,7 @@ function emptyVolces(error) {
 
 function resetBalancesState() {
   balancesCache = { ts: 0, payload: null };
+  walletHistory = [];
 }
 
 function assertAipddHost(url) {
@@ -867,6 +869,233 @@ async function fetchVolcBalance(ak, sk, now) {
   return cny;
 }
 
+const MIN_SPAN_HOURS = 2;
+const HISTORY_KEEP_SECS = 3 * 86400;
+const MAX_HISTORY = 200;
+const WALLET_COOKIE = "zm_wh";
+const WALLET_COOKIE_MAX_AGE = 3 * 86400;
+const WALLET_COOKIE_MAX_CHARS = 3500;
+
+function finiteCny(row) {
+  if (!row || row.cny == null) return null;
+  const n = Number(row.cny);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseHistNum(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function decodeWalletHistory(raw) {
+  let text = String(raw || "").trim();
+  if (!text) return [];
+  try {
+    text = decodeURIComponent(text);
+  } catch {
+    /* already decoded */
+  }
+  if (text.startsWith("v1.")) text = text.slice(3);
+  const out = [];
+  const parts = text.split(";");
+  for (let i = 0; i < parts.length; i++) {
+    const piece = parts[i].trim();
+    if (!piece) continue;
+    const bits = piece.split(",");
+    if (!bits.length) continue;
+    const ts = Number(bits[0]);
+    if (!Number.isFinite(ts)) continue;
+    out.push({
+      ts: ts,
+      aipdd: parseHistNum(bits[1]),
+      seedance: parseHistNum(bits[2]),
+    });
+  }
+  return out;
+}
+
+function encodeWalletHistory(hist) {
+  let points = Array.isArray(hist) ? hist.slice() : [];
+  function bodyOf(list) {
+    return (
+      "v1." +
+      list
+        .map(function (h) {
+          const a = h.aipdd == null || !Number.isFinite(Number(h.aipdd)) ? "" : String(h.aipdd);
+          const s = h.seedance == null || !Number.isFinite(Number(h.seedance)) ? "" : String(h.seedance);
+          return String(h.ts) + "," + a + "," + s;
+        })
+        .join(";")
+    );
+  }
+  let body = bodyOf(points);
+  while (body.length > WALLET_COOKIE_MAX_CHARS && points.length > 3) {
+    points = points.slice(1);
+    body = bodyOf(points);
+  }
+  return body;
+}
+
+function walletHistoryCookie(compact, requestUrl) {
+  const secure = String(requestUrl || "").startsWith("https:") ? "; Secure" : "";
+  return (
+    WALLET_COOKIE +
+    "=" +
+    encodeURIComponent(compact) +
+    "; Path=/; Max-Age=" +
+    WALLET_COOKIE_MAX_AGE +
+    "; SameSite=Lax" +
+    secure
+  );
+}
+
+function mergeWalletHistory(memory, cookiePts, nowSec) {
+  const byTs = new Map();
+  const sources = [memory || [], cookiePts || []];
+  for (let s = 0; s < sources.length; s++) {
+    const src = sources[s];
+    for (let i = 0; i < src.length; i++) {
+      const h = src[i];
+      if (!h) continue;
+      const ts = Number(h.ts);
+      if (!Number.isFinite(ts)) continue;
+      const prev = byTs.get(ts) || { ts: ts, aipdd: null, seedance: null };
+      byTs.set(ts, {
+        ts: ts,
+        aipdd: h.aipdd != null && Number.isFinite(Number(h.aipdd)) ? Number(h.aipdd) : prev.aipdd,
+        seedance: h.seedance != null && Number.isFinite(Number(h.seedance)) ? Number(h.seedance) : prev.seedance,
+      });
+    }
+  }
+  const cutoff = nowSec - HISTORY_KEEP_SECS;
+  let hist = Array.from(byTs.values())
+    .filter(function (h) {
+      return h.ts >= cutoff && h.ts <= nowSec + 120;
+    })
+    .sort(function (a, b) {
+      return a.ts - b.ts;
+    });
+  if (hist.length > MAX_HISTORY) hist = hist.slice(-MAX_HISTORY);
+  return hist;
+}
+
+function appendWalletSnapshot(hist, nowSec, aipddCny, seedCny) {
+  const list = Array.isArray(hist) ? hist.slice() : [];
+  const last = list.length ? list[list.length - 1] : null;
+  if (last && Math.abs(Number(last.ts) - nowSec) < 1) {
+    last.aipdd = aipddCny != null ? aipddCny : last.aipdd;
+    last.seedance = seedCny != null ? seedCny : last.seedance;
+    return list;
+  }
+  list.push({ ts: nowSec, aipdd: aipddCny, seedance: seedCny });
+  const cutoff = nowSec - HISTORY_KEEP_SECS;
+  let out = list.filter(function (h) {
+    return Number(h.ts) >= cutoff;
+  });
+  if (out.length > MAX_HISTORY) out = out.slice(-MAX_HISTORY);
+  return out;
+}
+
+function estimateRunway(hist, key, nowCny, now) {
+  const empty = {
+    burn_24h: null,
+    days_left: null,
+    sample_hours: 0,
+    reliable: false,
+  };
+  if (nowCny == null || !Number.isFinite(Number(nowCny))) return empty;
+  const nowN = Number(nowCny);
+  const points = [];
+  const src = hist || [];
+  for (let i = 0; i < src.length; i++) {
+    const h = src[i];
+    if (!h) continue;
+    if (h[key] == null) continue;
+    const ts = Number(h.ts || 0);
+    if (!Number.isFinite(ts) || ts >= now) continue;
+    points.push(h);
+  }
+  if (!points.length) return empty;
+  const target = now - 86400;
+  const windowed = [];
+  for (let i = 0; i < points.length; i++) {
+    const age = now - Number(points[i].ts);
+    if (age >= 18 * 3600 && age <= 36 * 3600) windowed.push(points[i]);
+  }
+  let old;
+  if (windowed.length) {
+    old = windowed[0];
+    let best = Math.abs(Number(old.ts) - target);
+    for (let i = 1; i < windowed.length; i++) {
+      const d = Math.abs(Number(windowed[i].ts) - target);
+      if (d < best) {
+        best = d;
+        old = windowed[i];
+      }
+    }
+  } else {
+    old = points[0];
+  }
+  const spanH = (now - Number(old.ts)) / 3600;
+  if (spanH < MIN_SPAN_HOURS) {
+    return {
+      burn_24h: null,
+      days_left: null,
+      sample_hours: roundN(spanH, 2),
+      reliable: false,
+    };
+  }
+  const oldCny = Number(old[key]);
+  const burned = oldCny - nowN;
+  if (burned <= 0.05) {
+    return {
+      burn_24h: 0,
+      days_left: null,
+      sample_hours: roundN(spanH, 2),
+      reliable: spanH >= 12,
+    };
+  }
+  const burn24h = (burned / spanH) * 24;
+  const days = burn24h > 0 ? nowN / burn24h : null;
+  return {
+    burn_24h: roundN(burn24h, 4),
+    days_left: days != null ? roundN(days, 2) : null,
+    sample_hours: roundN(spanH, 2),
+    reliable: spanH >= 6,
+  };
+}
+
+function recordWalletSnapshot(request, aipdd, volces) {
+  const now = Date.now() / 1000;
+  const cookiePts = decodeWalletHistory(cookieHeader(request, WALLET_COOKIE));
+  let hist = mergeWalletHistory(walletHistory, cookiePts, now);
+  const aipddCny = finiteCny(aipdd);
+  const seedCny = finiteCny(volces);
+  hist = appendWalletSnapshot(hist, now, aipddCny, seedCny);
+  walletHistory = hist;
+  const aRun = estimateRunway(hist, "aipdd", aipddCny, now);
+  const sRun = estimateRunway(hist, "seedance", seedCny, now);
+  aipdd.days_left = aRun.days_left;
+  aipdd.burn_24h = aRun.burn_24h;
+  aipdd.sample_hours = aRun.sample_hours;
+  aipdd.days_reliable = aRun.reliable;
+  volces.days_left = sRun.days_left;
+  volces.burn_24h = sRun.burn_24h;
+  volces.sample_hours = sRun.sample_hours;
+  volces.days_reliable = sRun.reliable;
+  return walletHistoryCookie(encodeWalletHistory(hist), request && request.url);
+}
+
+function respondBalances(request, payload) {
+  const aipdd = Object.assign({}, payload.aipdd);
+  const volces = Object.assign({}, payload.volces);
+  const cookie = recordWalletSnapshot(request, aipdd, volces);
+  return json(200, Object.assign({}, payload, { aipdd: aipdd, volces: volces }), { "Set-Cookie": cookie });
+}
+
 async function handleBalances(request, runtime) {
   const base = aipddBaseOf(runtime).replace(/\/+$/, "") || AIPDD_DEFAULT_BASE;
   const aipddKey = envOf(runtime, "AIPDD_API_KEY", "");
@@ -893,7 +1122,7 @@ async function handleBalances(request, runtime) {
   const refresh = isRefresh(url);
   const now = Date.now();
   if (!refresh && balancesCache.payload && now - balancesCache.ts < CACHE_TTL_MS) {
-    return json(200, Object.assign({}, balancesCache.payload, { cached: true }));
+    return respondBalances(request, Object.assign({}, balancesCache.payload, { cached: true }));
   }
 
   let used = 0;
@@ -965,7 +1194,7 @@ async function handleBalances(request, runtime) {
     cached: false,
   };
   balancesCache = { ts: Date.now(), payload: payload };
-  return json(200, payload);
+  return respondBalances(request, payload);
 }
 
 export {
@@ -980,6 +1209,12 @@ export {
   verifySessionToken,
   renderLoginPage,
   SESSION_COOKIE,
+  estimateRunway,
+  decodeWalletHistory,
+  encodeWalletHistory,
+  mergeWalletHistory,
+  appendWalletSnapshot,
+  WALLET_COOKIE,
 };
 
 export default {
