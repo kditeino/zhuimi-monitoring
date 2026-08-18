@@ -144,6 +144,18 @@ TYPE_LABELS = {
 _cache_lock = threading.Lock()
 _cache: dict[str, Any] = {"ts": 0.0, "status": None, "logs": None}
 _balances_cache: dict[str, Any] = {"ts": 0.0, "payload": None}
+MIN_SPAN_HOURS = 2.0
+HISTORY_KEEP_SECS = 3 * 86400
+MAX_HISTORY = 200
+SEED_MAX_AGE = 36 * 3600
+WALLET_SEED = [
+    {"ts": 1787056427, "aipdd": 127.4249, "seedance": 798.96},
+    {"ts": 1787058075, "aipdd": 125.8959, "seedance": 797.3},
+    {"ts": 1787060117, "aipdd": 125.1559, "seedance": 790.97},
+    {"ts": 1787061782, "aipdd": 122.1959, "seedance": 783.98},
+    {"ts": 1787067231, "aipdd": 122.1959, "seedance": 781.66},
+]
+_wallet_history: list[dict[str, Any]] = []
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -763,6 +775,154 @@ def _fetch_volc_balance(ak: str, sk: str) -> float:
     return n
 
 
+
+def _history_paths() -> list[Path]:
+    return [APP_DIR / "balance-history.json", Path("/tmp/zhuimi-balance-history.json")]
+
+
+def _load_wallet_history_file() -> list[dict[str, Any]]:
+    for path in _history_paths():
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("history"), list):
+            return list(data.get("history") or [])
+    return []
+
+
+def _save_wallet_history_file(hist: list[dict[str, Any]]) -> None:
+    payload = json.dumps(hist, ensure_ascii=False)
+    for path in _history_paths():
+        try:
+            path.write_text(payload + "\n", encoding="utf-8")
+            return
+        except OSError:
+            continue
+
+
+def _finite_wallet_cny(row: dict[str, Any] | None) -> float | None:
+    if not row:
+        return None
+    return _as_finite_number(row.get("cny"))
+
+
+def _merge_wallet_history(*sources: Any, now: float) -> list[dict[str, Any]]:
+    by_ts: dict[float, dict[str, Any]] = {}
+    for src in sources:
+        for h in src or []:
+            if not isinstance(h, dict):
+                continue
+            try:
+                ts = float(h.get("ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not ts:
+                continue
+            prev = by_ts.get(ts) or {"ts": ts, "aipdd": None, "seedance": None}
+            a = _as_finite_number(h.get("aipdd"))
+            s = _as_finite_number(h.get("seedance"))
+            by_ts[ts] = {
+                "ts": ts,
+                "aipdd": a if a is not None else prev.get("aipdd"),
+                "seedance": s if s is not None else prev.get("seedance"),
+            }
+    cutoff = now - HISTORY_KEEP_SECS
+    hist = [h for h in by_ts.values() if cutoff <= float(h["ts"]) <= now + 120]
+    hist.sort(key=lambda x: float(x["ts"]))
+    if len(hist) > MAX_HISTORY:
+        hist = hist[-MAX_HISTORY:]
+    return hist
+
+
+def _append_wallet_snapshot(
+    hist: list[dict[str, Any]], now: float, aipdd: float | None, seed: float | None
+) -> list[dict[str, Any]]:
+    out = list(hist)
+    if out and abs(float(out[-1]["ts"]) - now) < 1:
+        if aipdd is not None:
+            out[-1]["aipdd"] = aipdd
+        if seed is not None:
+            out[-1]["seedance"] = seed
+        return out
+    out.append({"ts": now, "aipdd": aipdd, "seedance": seed})
+    cutoff = now - HISTORY_KEEP_SECS
+    out = [h for h in out if float(h["ts"]) >= cutoff]
+    if len(out) > MAX_HISTORY:
+        out = out[-MAX_HISTORY:]
+    return out
+
+
+def estimate_runway(hist: list, key: str, now_cny: float | None, now: float) -> dict[str, Any]:
+    empty = {
+        "burn_24h": None,
+        "days_left": None,
+        "sample_hours": 0.0,
+        "reliable": False,
+    }
+    if now_cny is None:
+        return empty
+    points = [
+        h for h in hist
+        if h.get(key) is not None and float(h.get("ts") or 0) < now
+    ]
+    if not points:
+        return empty
+    target = now - 86400
+    windowed = [h for h in points if 18 * 3600 <= now - float(h["ts"]) <= 36 * 3600]
+    if windowed:
+        old = min(windowed, key=lambda h: abs(float(h["ts"]) - target))
+    else:
+        old = points[0]
+    span_h = (now - float(old["ts"])) / 3600.0
+    if span_h < MIN_SPAN_HOURS:
+        return {**empty, "sample_hours": round(span_h, 2)}
+    old_cny = float(old[key])
+    burned = old_cny - now_cny
+    if burned <= 0.05:
+        return {
+            "burn_24h": 0.0,
+            "days_left": None,
+            "sample_hours": round(span_h, 2),
+            "reliable": span_h >= 12,
+        }
+    burn_24h = burned / span_h * 24.0
+    days = now_cny / burn_24h if burn_24h > 0 else None
+    return {
+        "burn_24h": round(burn_24h, 4),
+        "days_left": round(days, 2) if days is not None else None,
+        "sample_hours": round(span_h, 2),
+        "reliable": span_h >= 6,
+    }
+
+
+def _attach_runway(aipdd: dict[str, Any], volces: dict[str, Any]) -> None:
+    global _wallet_history
+    now = time.time()
+    seed = [p for p in WALLET_SEED if now - p["ts"] <= SEED_MAX_AGE]
+    with _cache_lock:
+        hist = _merge_wallet_history(_wallet_history, _load_wallet_history_file(), seed, now=now)
+        a_cny = _finite_wallet_cny(aipdd)
+        s_cny = _finite_wallet_cny(volces)
+        hist = _append_wallet_snapshot(hist, now, a_cny, s_cny)
+        _wallet_history = hist
+        _save_wallet_history_file(hist)
+        a_run = estimate_runway(hist, "aipdd", a_cny, now)
+        s_run = estimate_runway(hist, "seedance", s_cny, now)
+    aipdd["days_left"] = a_run["days_left"]
+    aipdd["burn_24h"] = a_run["burn_24h"]
+    aipdd["sample_hours"] = a_run["sample_hours"]
+    aipdd["days_reliable"] = a_run["reliable"]
+    volces["days_left"] = s_run["days_left"]
+    volces["burn_24h"] = s_run["burn_24h"]
+    volces["sample_hours"] = s_run["sample_hours"]
+    volces["days_reliable"] = s_run["reliable"]
+
+
 def build_balances(env: dict[str, str], force: bool = False) -> dict[str, Any]:
     """Official AIPDD AWCoin + Volcengine billing balances. Missing keys stay unconfigured."""
     generated_at = datetime.now(TZ_SH).strftime("%Y-%m-%d %H:%M:%S")
@@ -786,6 +946,11 @@ def build_balances(env: dict[str, str], force: bool = False) -> dict[str, Any]:
         cached_ts = float(_balances_cache.get("ts") or 0)
     if not force and cached_payload is not None and (time.time() - cached_ts) < CACHE_TTL_SEC:
         out = dict(cached_payload)
+        aipdd_c = dict(out.get("aipdd") or {})
+        volces_c = dict(out.get("volces") or {})
+        _attach_runway(aipdd_c, volces_c)
+        out["aipdd"] = aipdd_c
+        out["volces"] = volces_c
         out["cached"] = True
         return out
 
@@ -823,6 +988,7 @@ def build_balances(env: dict[str, str], force: bool = False) -> dict[str, Any]:
         except Exception:
             volces = {"configured": True, "cny": None, "usd": None, "error": "火山引擎余额查询失败"}
 
+    _attach_runway(aipdd, volces)
     payload = {
         "ok": True,
         "aipdd": aipdd,
