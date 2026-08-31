@@ -4,7 +4,8 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import worker, {
-  CREATE_CREDIT_CNY,
+  DEFAULT_CREDIT_CNY,
+  MAX_CREDIT_CNY,
   SESSION_COOKIE,
   TAG_ASSET,
   TAG_FACE,
@@ -13,6 +14,7 @@ import worker, {
   isDuplicateUsernameError,
   makeSessionToken,
   nextDailyUsername,
+  parseCreditCny,
   quotaUnitsForCny,
   resetOverviewCache,
   shanghaiMMDD,
@@ -105,6 +107,12 @@ describe("log extra tags and clickable chips", { concurrency: 1 }, () => {
     assert.ok(html.includes("新增用户"));
     assert.ok(html.includes('id="refreshBtn"'));
     assert.ok(html.includes("header-actions"));
+    assert.ok(html.includes('id="createCreditCny"'));
+    assert.ok(html.includes("额度 ¥"));
+    assert.match(html, /id="createCreditCny"[^>]*value="100"/);
+    assert.ok(html.includes("credit_cny"));
+    assert.ok(html.includes("确认新增用户并充值"));
+    assert.ok(!html.includes("确认新增用户并充值 ¥100？"));
     assert.ok(html.indexOf('id="refreshBtn"') < html.indexOf('id="createUserBtn"'));
     assert.ok(html.includes("全部"));
     assert.ok(html.includes(TAG_FACE));
@@ -133,11 +141,33 @@ describe("create user", { concurrency: 1 }, () => {
     resetOverviewCache();
   });
 
-  test("¥100 uses site conversion, not quota:100", () => {
-    assert.equal(CREATE_CREDIT_CNY, 100);
+  test("CNY converts with site rate; omitted credit defaults to 100, not quota:100", () => {
+    assert.equal(DEFAULT_CREDIT_CNY, 100);
     assert.equal(quotaUnitsForCny(100, 500000, 7.3), 6849315);
+    assert.equal(quotaUnitsForCny(200, 500000, 7.3), 13698630);
     assert.ok(!workerSrc.includes("quota: 100"));
     assert.ok(!workerSrc.includes("quota:100"));
+    assert.ok(!html.includes("SUSCIYUAN_ACCESS_TOKEN"));
+  });
+
+  test("parseCreditCny requires a finite amount > 0 and ignores quota units", () => {
+    assert.deepEqual(parseCreditCny(undefined), { ok: true, value: 100, defaulted: true });
+    assert.deepEqual(parseCreditCny(null), { ok: true, value: 100, defaulted: true });
+    assert.equal(parseCreditCny(200).value, 200);
+    assert.equal(parseCreditCny("200").value, 200);
+    assert.equal(parseCreditCny(" 50.5 ").value, 50.5);
+    assert.equal(parseCreditCny("").ok, false);
+    assert.equal(parseCreditCny("   ").ok, false);
+    assert.equal(parseCreditCny(0).ok, false);
+    assert.equal(parseCreditCny(-1).ok, false);
+    assert.equal(parseCreditCny(NaN).ok, false);
+    assert.equal(parseCreditCny(Infinity).ok, false);
+    assert.equal(parseCreditCny("abc").ok, false);
+    assert.equal(parseCreditCny(true).ok, false);
+    assert.equal(parseCreditCny({ quota: 6849315 }).ok, false);
+    assert.equal(parseCreditCny(MAX_CREDIT_CNY + 1).ok, false);
+    assert.equal(parseCreditCny(MAX_CREDIT_CNY).ok, true);
+    assert.ok(MAX_CREDIT_CNY >= 200);
   });
 
   test("User_MMDDnn takes max suffix and pads to 2 digits", () => {
@@ -175,7 +205,7 @@ describe("create user", { concurrency: 1 }, () => {
     assert.equal(other.status, 401);
   });
 
-  test("POST /api/create-user creates User_MMDDnn, adds ¥100 quota, never exposes token", async () => {
+  test("POST /api/create-user creates User_MMDDnn, converts credit_cny server-side, never exposes token", async () => {
     const mmdd = shanghaiMMDD(new Date());
     const expectedName = "User_" + mmdd + "02";
     const seen = [];
@@ -216,7 +246,8 @@ describe("create user", { concurrency: 1 }, () => {
         assert.equal(body.id, 44);
         assert.equal(body.action, "add_quota");
         assert.equal(body.mode, "add");
-        assert.equal(body.value, 6849315);
+        assert.equal(body.value, 13698630);
+        assert.notEqual(body.value, 200);
         assert.notEqual(body.value, 100);
         return jsonRes({ success: true, message: "" });
       }
@@ -228,7 +259,7 @@ describe("create user", { concurrency: 1 }, () => {
       new Request("https://monitor.test/api/create-user", {
         method: "POST",
         headers: { Cookie: SESSION_COOKIE + "=" + token, "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({ credit_cny: 200, quota: 100 }),
       }),
       {}
     );
@@ -236,13 +267,50 @@ describe("create user", { concurrency: 1 }, () => {
     const body = await res.json();
     assert.equal(body.ok, true);
     assert.equal(body.username, expectedName);
-    assert.equal(body.credit_cny, 100);
-    assert.equal(body.quota, 6849315);
+    assert.equal(body.credit_cny, 200);
+    assert.equal(body.quota, 13698630);
     assert.equal(body.password.length, 10);
     const dumped = JSON.stringify(body);
     assert.ok(!dumped.includes("sus-token-secret"));
     assert.ok(seen.some((s) => s.startsWith("POST ") && s.includes("/api/user/")));
     assert.ok(seen.some((s) => s.includes("/api/user/manage")));
+  });
+
+  test("POST /api/create-user rejects invalid credit_cny and ignores client quota units", async () => {
+    globalThis.BAKED_ENV = {
+      DASHBOARD_PASSWORD: "",
+      SUSCIYUAN_ACCESS_TOKEN: "sus-token",
+    };
+    let upstream = 0;
+    globalThis.fetch = async () => {
+      upstream += 1;
+      throw new Error("should not call New API");
+    };
+    const bad = await worker.fetch(
+      new Request("https://monitor.test/api/create-user", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credit_cny: -5, quota: 6849315 }),
+      }),
+      {}
+    );
+    assert.equal(bad.status, 400);
+    const badBody = await bad.json();
+    assert.equal(badBody.ok, false);
+    assert.match(badBody.error, /大于 0/);
+    assert.equal(upstream, 0);
+
+    const nan = await worker.fetch(
+      new Request("https://monitor.test/api/create-user", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credit_cny: "nope" }),
+      }),
+      {}
+    );
+    assert.equal(nan.status, 400);
+    assert.equal((await nan.json()).ok, false);
+    assert.equal(upstream, 0);
   });
 
   test("duplicate username bumps nn; quota-add failure keeps username", async () => {

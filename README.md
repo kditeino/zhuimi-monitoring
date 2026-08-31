@@ -13,7 +13,7 @@
 
 - H5 看板：近 3 天用量、错误、用户/模型分布（默认全站 `site_wide`）
 - 日志类型 / 模型芯片可点击筛选；匹配火山真人拦截或参考素材的行带「真人脸」「素材库」标签
-- 「新增用户」：边缘函数代调 New API 创建当日 `User_MMDDnn` 并加 ¥100 额度，密钥不进页面源码
+- 「新增用户」：边缘函数代调 New API 创建当日 `User_MMDDnn`，按输入的人民币额度换算后加配额，默认 ¥100，密钥不进页面源码
 - 错误日志轮询：`monitor.py` 按上次看到的 log id 增量拉取 type=5 错误
 - 摘要渲染：`render_report.py` 从本地看板 `/api/report` 生成 HTML 摘要
 
@@ -106,7 +106,7 @@ python3 render_report.py --period evening
 | `GET /api/session` | 会话是否有效（未登录 JSON 401，不带 Basic 弹窗） |
 | `GET /api/overview` | 指标 + 近 3 天日志（`?refresh=1` 跳过缓存；日志带 `tags` / `tag_counts`） |
 | `GET /api/balances` | 官方 AIPDD AWCoin 剩余 + 火山引擎账单可用余额（`?refresh=1` 跳过约 45s 缓存；不增加 overview 出站请求） |
-| `POST /api/create-user` | 需登录会话。服务端创建 New API 用户并增加 ¥100 额度，返回一次性密码 |
+| `POST /api/create-user` | 需登录会话。JSON `credit_cny`（人民币，默认 100）。服务端换算配额后创建用户，返回一次性密码 |
 | `GET /api/report?hours=12` | 结构化摘要（仅 Python） |
 | `GET /api/report?period=morning / evening` | 半天窗口摘要（仅 Python） |
 | `GET /api/health` | 存活检查 |

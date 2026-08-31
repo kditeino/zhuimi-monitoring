@@ -209,6 +209,31 @@
       flex-shrink: 0;
       align-items: center;
     }
+    .credit-field {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 550;
+      white-space: nowrap;
+    }
+    .credit-field input {
+      width: 72px;
+      border: 1px solid var(--line-strong);
+      background: var(--bg-card);
+      color: var(--text);
+      border-radius: 9px;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-family: inherit;
+      font-variant-numeric: tabular-nums;
+    }
+    .credit-field input:focus {
+      outline: 2px solid var(--steel);
+      outline-offset: 1px;
+    }
+    .credit-field input:disabled { opacity: .55; }
     .pill {
       display: inline-flex; align-items: center;
       background: var(--steel-dim);
@@ -465,6 +490,9 @@
         <span id="genText"></span>
         <span class="header-actions">
           <button class="btn" id="refreshBtn" type="button">立即刷新</button>
+          <label class="credit-field">额度 ¥
+            <input id="createCreditCny" type="number" min="0.01" max="100000" step="1" value="100" inputmode="decimal" />
+          </label>
           <button class="btn" id="createUserBtn" type="button">新增用户</button>
         </span>
         <a class="btn" id="logoutLink" href="/api/logout">退出</a>
@@ -1115,6 +1143,30 @@
       }
     }
 
+    function formatCreditLabel(n) {
+      const x = Number(n);
+      if (!Number.isFinite(x)) return "¥—";
+      if (Number.isInteger(x)) return "¥" + String(x);
+      return "¥" + x.toFixed(2);
+    }
+
+    function readCreditCnyInput() {
+      const el = document.getElementById("createCreditCny");
+      const raw = el ? String(el.value) : "";
+      if (!raw.trim()) return { ok: false, error: "请填写额度" };
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return { ok: false, error: "额度必须是数字" };
+      if (n <= 0) return { ok: false, error: "额度必须大于 0" };
+      if (n > 100000) return { ok: false, error: "额度不能超过 ¥100000" };
+      return { ok: true, value: Math.round(n * 100) / 100 };
+    }
+
+    function showCreditInputError(msg) {
+      const errBox = document.getElementById("errorBox");
+      errBox.classList.remove("hidden");
+      errBox.textContent = msg;
+    }
+
     function credentialBlock(username, password) {
       return [
         "------------------------------------------",
@@ -1134,7 +1186,9 @@
       box.classList.remove("hidden");
       if (data && data.username) {
         status.className = isError ? "warn" : "ok";
-        status.textContent = isError ? (data.error || "用户已创建，但额度可能未加上") : "已创建用户 · ¥100";
+        status.textContent = isError
+          ? (data.error || "用户已创建，但额度可能未加上")
+          : "已创建用户 · " + formatCreditLabel(data.credit_cny);
         pre.textContent = credentialBlock(data.username, data.password || "");
       } else {
         status.className = "warn";
@@ -1169,15 +1223,24 @@
 
     async function createUser() {
       const btn = document.getElementById("createUserBtn");
-      if (!window.confirm("确认新增用户并充值 ¥100？")) return;
+      const input = document.getElementById("createCreditCny");
+      const parsed = readCreditCnyInput();
+      if (!parsed.ok) {
+        showCreditInputError(parsed.error);
+        if (input) input.focus();
+        return;
+      }
+      if (!window.confirm("确认新增用户并充值 " + formatCreditLabel(parsed.value) + "？")) return;
+      document.getElementById("errorBox").classList.add("hidden");
       btn.disabled = true;
+      if (input) input.disabled = true;
       btn.textContent = "创建中";
       try {
         const res = await fetch("/api/create-user", {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
-          body: "{}",
+          body: JSON.stringify({ credit_cny: parsed.value }),
         });
         if (res.status === 401) { location.replace("/"); return; }
         const data = await res.json();
@@ -1190,6 +1253,7 @@
         showCreateUserResult({ error: "创建失败：" + (e.message || e) }, true);
       } finally {
         btn.disabled = false;
+        if (input) input.disabled = false;
         btn.textContent = "新增用户";
       }
     }
