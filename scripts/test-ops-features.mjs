@@ -104,6 +104,7 @@ describe("log extra tags and clickable chips", { concurrency: 1 }, () => {
     assert.ok(html.includes('id="createUserBtn"'));
     assert.ok(html.includes("新增用户"));
     assert.ok(html.includes('id="refreshBtn"'));
+    assert.ok(html.includes("header-actions"));
     assert.ok(html.indexOf('id="refreshBtn"') < html.indexOf('id="createUserBtn"'));
     assert.ok(html.includes("全部"));
     assert.ok(html.includes(TAG_FACE));

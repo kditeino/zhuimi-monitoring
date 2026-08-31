@@ -203,6 +203,12 @@
       gap: 8px 10px;
       align-items: center;
     }
+    .header-actions {
+      display: inline-flex;
+      gap: 6px;
+      flex-shrink: 0;
+      align-items: center;
+    }
     .pill {
       display: inline-flex; align-items: center;
       background: var(--steel-dim);
@@ -284,7 +290,7 @@
     }
     .chip.selected {
       background: var(--bg-active);
-      border-color: var(--row-active-bd);
+      border-color: var(--steel);
       color: var(--text);
     }
     .chip b { font-weight: 650; color: var(--text); }
@@ -295,12 +301,9 @@
     .badge.extra { cursor: pointer; }
     .badge.tag-face { background: var(--error-dim); color: var(--badge-error-fg); border-color: var(--badge-error-bd); }
     .badge.tag-asset { background: var(--steel-dim); color: var(--steel); border-color: var(--pill-bd); }
-    .create-user-box {
-      background: var(--bg-card);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      padding: 12px 14px;
-      margin-bottom: 12px;
+    .create-user-box pre.full {
+      white-space: pre;
+      overflow-x: auto;
     }
     .create-user-head {
       display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
@@ -460,8 +463,10 @@
         <span class="pill" id="scopePill">全站</span>
         <span id="windowText">近 3 天</span>
         <span id="genText"></span>
-        <button class="btn" id="refreshBtn" type="button">立即刷新</button>
-        <button class="btn" id="createUserBtn" type="button">新增用户</button>
+        <span class="header-actions">
+          <button class="btn" id="refreshBtn" type="button">立即刷新</button>
+          <button class="btn" id="createUserBtn" type="button">新增用户</button>
+        </span>
         <a class="btn" id="logoutLink" href="/api/logout">退出</a>
       </div>
     </header>
