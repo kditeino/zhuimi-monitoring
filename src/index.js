@@ -9,7 +9,8 @@ const TYPE_LABELS = {
 
 const TAG_FACE = "真人脸";
 const TAG_ASSET = "素材库";
-const CREATE_CREDIT_CNY = 100;
+const DEFAULT_CREDIT_CNY = 100;
+const MAX_CREDIT_CNY = 100000;
 
 const LOG_WINDOW_DAYS = 3;
 const LOG_CAP = 300;
@@ -592,6 +593,35 @@ function quotaUnitsForCny(cny, quotaPerUnit, usdRate) {
   return Math.round((Number(cny) * unit) / rate);
 }
 
+function parseCreditCny(raw) {
+  if (raw === undefined || raw === null) {
+    return { ok: true, value: DEFAULT_CREDIT_CNY, defaulted: true };
+  }
+  if (typeof raw === "boolean" || (typeof raw === "object" && raw !== null)) {
+    return { ok: false, error: "额度必须是数字" };
+  }
+  if (typeof raw === "string" && !raw.trim()) {
+    return { ok: false, error: "请填写额度" };
+  }
+  const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (!Number.isFinite(n)) return { ok: false, error: "额度必须是数字" };
+  if (n <= 0) return { ok: false, error: "额度必须大于 0" };
+  if (n > MAX_CREDIT_CNY) return { ok: false, error: "额度不能超过 ¥" + MAX_CREDIT_CNY };
+  return { ok: true, value: Math.round(n * 100) / 100 };
+}
+
+async function readJsonObject(request) {
+  const text = await request.text();
+  if (!text || !String(text).trim()) return {};
+  try {
+    const val = JSON.parse(text);
+    if (val && typeof val === "object" && !Array.isArray(val)) return val;
+    return { __invalid: true };
+  } catch {
+    return { __invalidJson: true };
+  }
+}
+
 function nextDailyUsername(usernames, mmdd) {
   const day = String(mmdd || "");
   const re = new RegExp("^User_" + day + "(\\d+)$", "i");
@@ -889,8 +919,18 @@ async function handleCreateUser(request, runtime) {
     return json(500, { ok: false, error: "missing SUSCIYUAN_ACCESS_TOKEN" });
   }
 
+  const body = await readJsonObject(request);
+  if (body.__invalid || body.__invalidJson) {
+    return json(400, { ok: false, error: "额度格式不对" });
+  }
+  const parsed = parseCreditCny(body.credit_cny);
+  if (!parsed.ok) {
+    return json(400, { ok: false, error: parsed.error });
+  }
+  const creditCny = parsed.value;
+
   const conv = await resolveConversion(base, token, adminUserId);
-  const quotaValue = quotaUnitsForCny(CREATE_CREDIT_CNY, conv.quotaPerUnit, conv.usdRate);
+  const quotaValue = quotaUnitsForCny(creditCny, conv.quotaPerUnit, conv.usdRate);
   const mmdd = shanghaiMMDD(new Date());
   const names = await listDailyUsernames(base, token, adminUserId, mmdd);
   let serial = nextDailyUsername(names, mmdd);
@@ -982,7 +1022,7 @@ async function handleCreateUser(request, runtime) {
     username: createdName,
     password: password,
     quota: quotaValue,
-    credit_cny: CREATE_CREDIT_CNY,
+    credit_cny: creditCny,
   });
 }
 
@@ -1591,9 +1631,11 @@ export {
   generatePassword,
   isDuplicateUsernameError,
   extractUsers,
+  parseCreditCny,
   TAG_FACE,
   TAG_ASSET,
-  CREATE_CREDIT_CNY,
+  DEFAULT_CREDIT_CNY,
+  MAX_CREDIT_CNY,
 };
 
 export default {
