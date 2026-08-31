@@ -123,7 +123,8 @@ describe("log extra tags and clickable chips", { concurrency: 1 }, () => {
     assert.ok(html.includes('data-kind="type"'));
     assert.ok(html.includes("模型平台地址：https://susciyuan.com"));
     assert.ok(html.includes("登录地址后可以自行创建多个KEY（API秘钥)"));
-    assert.ok(html.includes("Seedance接口使用方法参见：https://aiworkin.feishu.cn/wiki/RZXkwDbzqi2auAkuF3EcJGWknVh"));
+    assert.ok(html.includes("Seedance接口使用方法参见：https://s.apifox.cn/fea0b520-e6d9-489c-ae5e-109391c771dd/9376375m0"));
+    assert.ok(!html.includes("aiworkin.feishu.cn"));
     assert.ok(html.includes("navigator.clipboard"));
     assert.ok(!html.includes("SUSCIYUAN_ACCESS_TOKEN"));
     assert.ok(!html.includes("quota:100"));
