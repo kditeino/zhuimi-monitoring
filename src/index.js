@@ -7,6 +7,10 @@ const TYPE_LABELS = {
   6: "退款",
 };
 
+const TAG_FACE = "真人脸";
+const TAG_ASSET = "素材库";
+const CREATE_CREDIT_CNY = 100;
+
 const LOG_WINDOW_DAYS = 3;
 const LOG_CAP = 300;
 const PAGE_SIZE = 100;
@@ -533,6 +537,141 @@ function typeLabel(typ) {
   return TYPE_LABELS[typ] || ("类型" + typ);
 }
 
+function shanghaiMMDD(date) {
+  const p = shanghaiParts(date || new Date());
+  return p.month + p.day;
+}
+
+function flattenLogHaystack(content, other) {
+  let extra = "";
+  if (other && typeof other === "object") extra = JSON.stringify(other);
+  else if (other != null) extra = String(other);
+  return String(content || "") + "\n" + extra;
+}
+
+function isRealPersonText(text) {
+  const s = String(text || "");
+  return /may contain real person/i.test(s) || /真人/.test(s);
+}
+
+function isAssetLibraryText(text, other) {
+  const s = String(text || "");
+  if (
+    /reference[-_\s]?image/i.test(s) ||
+    /reference[-_\s]?video/i.test(s) ||
+    /image_url/i.test(s) ||
+    /video_url/i.test(s) ||
+    /resource[-_\s]?download/i.test(s) ||
+    /has_reference_video/i.test(s) ||
+    /参考图/.test(s) ||
+    /参考视频/.test(s) ||
+    /参考素材/.test(s) ||
+    /素材/.test(s)
+  ) {
+    return true;
+  }
+  if (other && typeof other === "object") {
+    if (other.has_reference_video) return true;
+    if (/reference_video/i.test(String(other.pricing_variant || ""))) return true;
+  }
+  return false;
+}
+
+function extraTagsForLog(item) {
+  const other = parseOther(item && item.other);
+  const text = flattenLogHaystack(item && item.content, other);
+  const tags = [];
+  if (isRealPersonText(text)) tags.push(TAG_FACE);
+  if (isAssetLibraryText(text, other)) tags.push(TAG_ASSET);
+  return tags;
+}
+
+function quotaUnitsForCny(cny, quotaPerUnit, usdRate) {
+  const unit = Number(quotaPerUnit) || 500000;
+  const rate = Number(usdRate) || 7.3;
+  return Math.round((Number(cny) * unit) / rate);
+}
+
+function nextDailyUsername(usernames, mmdd) {
+  const day = String(mmdd || "");
+  const re = new RegExp("^User_" + day + "(\\d+)$", "i");
+  let max = 0;
+  const list = usernames || [];
+  for (let i = 0; i < list.length; i++) {
+    const m = String(list[i] || "").match(re);
+    if (!m) continue;
+    const n = parseInt(m[1], 10);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  const next = max + 1;
+  return "User_" + day + String(next).padStart(Math.max(2, String(next).length), "0");
+}
+
+function generatePassword() {
+  const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const lower = "abcdefghijklmnopqrstuvwxyz";
+  const digit = "0123456789";
+  const symbol = "!@#$%^&*()-_=+[]{};:,.<>/?~";
+  const all = upper + lower + digit + symbol;
+  function pick(alphabet) {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    return alphabet[buf[0] % alphabet.length];
+  }
+  const chars = [pick(upper), pick(lower), pick(digit), pick(symbol)];
+  for (let i = 4; i < 10; i++) chars.push(pick(all));
+  for (let i = chars.length - 1; i > 0; i--) {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    const j = buf[0] % (i + 1);
+    const tmp = chars[i];
+    chars[i] = chars[j];
+    chars[j] = tmp;
+  }
+  return chars.join("");
+}
+
+function isDuplicateUsernameError(message) {
+  const s = String(message || "");
+  return /duplicate|unique|already exists|exist|已存在|占用|重复|taken/i.test(s);
+}
+
+function extractUsers(payload) {
+  if (!payload) return [];
+  const data = payload.data;
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.items)) return data.items;
+  if (data && Array.isArray(data.users)) return data.users;
+  if (Array.isArray(payload.items)) return payload.items;
+  if (Array.isArray(payload)) return payload;
+  return [];
+}
+
+function extractUsernames(payload) {
+  return extractUsers(payload)
+    .map(function (u) {
+      if (typeof u === "string") return u;
+      return u && u.username != null ? String(u.username) : "";
+    })
+    .filter(Boolean);
+}
+
+function pickCreatedUserId(payload) {
+  const data = payload && payload.data;
+  if (!data || typeof data !== "object") return null;
+  if (data.id != null && Number.isFinite(Number(data.id))) return Number(data.id);
+  if (data.user && data.user.id != null && Number.isFinite(Number(data.user.id))) return Number(data.user.id);
+  return null;
+}
+
+function conversionFromStatus(status) {
+  const src = status || {};
+  return {
+    quotaPerUnit: Number(src.quota_per_unit || 500000),
+    usdRate: Number(src.usd_exchange_rate || src.price || 7.3),
+  };
+}
+
 function dedupeById(items) {
   const seen = new Set();
   const out = [];
@@ -587,10 +726,20 @@ function formatLog(item, quotaPerUnit, usdRate) {
     completion_tokens: item.completion_tokens || 0,
     ip: item.ip || "",
     other,
+    tags: extraTagsForLog(item),
   };
 }
 
-async function apiGet(base, token, userId, path, params) {
+function newApiHeaders(token, userId) {
+  return {
+    Authorization: "Bearer " + token,
+    "New-Api-User": String(userId),
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+}
+
+function newApiUrl(base, path, params) {
   const root = base.endsWith("/") ? base : base + "/";
   const url = new URL(path, root);
   if (params) {
@@ -598,34 +747,243 @@ async function apiGet(base, token, userId, path, params) {
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
     }
   }
-  const res = await fetch(url.toString(), {
+  return url.toString();
+}
+
+function parseUpstreamJson(text, httpStatus) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const err = new Error(httpStatus && httpStatus >= 300 ? "upstream HTTP " + httpStatus : "upstream invalid JSON");
+    err.status = 502;
+    throw err;
+  }
+}
+
+async function apiGet(base, token, userId, path, params) {
+  const res = await fetch(newApiUrl(base, path, params), {
     method: "GET",
     redirect: "manual",
-    headers: {
-      Authorization: "Bearer " + token,
-      "New-Api-User": String(userId),
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
+    headers: newApiHeaders(token, userId),
   });
   if (!res.ok || (res.status >= 300 && res.status < 400)) {
     const err = new Error("upstream HTTP " + res.status);
     err.status = 502;
     throw err;
   }
+  return parseUpstreamJson(await res.text(), res.status);
+}
+
+async function apiPost(base, token, userId, path, body) {
+  const res = await fetch(newApiUrl(base, path, null), {
+    method: "POST",
+    redirect: "manual",
+    headers: newApiHeaders(token, userId),
+    body: body != null ? JSON.stringify(body) : "{}",
+  });
   const text = await res.text();
+  let payload = null;
   try {
-    return JSON.parse(text);
+    payload = JSON.parse(text);
   } catch {
+    payload = null;
+  }
+  if (!res.ok || (res.status >= 300 && res.status < 400)) {
+    const msg = (payload && (payload.message || payload.error)) || "upstream HTTP " + res.status;
+    const err = new Error(String(msg));
+    err.status = 502;
+    err.httpStatus = res.status;
+    err.payload = payload;
+    throw err;
+  }
+  if (!payload) {
     const err = new Error("upstream invalid JSON");
     err.status = 502;
     throw err;
   }
+  return payload;
 }
 
 async function fetchStatus(base, token, userId) {
   const data = await apiGet(base, token, userId, "/api/status", null);
   return data.data || {};
+}
+
+async function listDailyUsernames(base, token, userId, mmdd) {
+  const names = [];
+  try {
+    const payload = await apiGet(base, token, userId, "/api/user/search", {
+      keyword: "User_" + mmdd,
+      p: 1,
+      page_size: 100,
+    });
+    names.push.apply(names, extractUsernames(payload));
+    return names;
+  } catch {
+    /* older New API may not have /search */
+  }
+  try {
+    for (let p = 1; p <= 3; p++) {
+      const payload = await apiGet(base, token, userId, "/api/user/", {
+        p: p,
+        page_size: 100,
+      });
+      const batch = extractUsers(payload);
+      names.push.apply(names, extractUsernames({ data: { items: batch } }));
+      if (!batch.length) break;
+      const total = payload && payload.data && payload.data.total;
+      if (total != null && names.length >= Number(total)) break;
+    }
+  } catch {
+    /* start at 01 and let duplicate handling bump */
+  }
+  return names;
+}
+
+async function findUserByUsername(base, token, userId, username) {
+  try {
+    const payload = await apiGet(base, token, userId, "/api/user/search", {
+      keyword: username,
+      p: 1,
+      page_size: 50,
+    });
+    const users = extractUsers(payload);
+    const hit = users.find(function (u) {
+      return String((u && u.username) || "").toLowerCase() === String(username).toLowerCase();
+    });
+    if (hit) return hit;
+  } catch {
+    /* fall through */
+  }
+  try {
+    for (let p = 1; p <= 3; p++) {
+      const payload = await apiGet(base, token, userId, "/api/user/", {
+        p: p,
+        page_size: 100,
+      });
+      const users = extractUsers(payload);
+      const hit = users.find(function (u) {
+        return String((u && u.username) || "").toLowerCase() === String(username).toLowerCase();
+      });
+      if (hit) return hit;
+      if (!users.length) break;
+    }
+  } catch {
+    /* not found */
+  }
+  return null;
+}
+
+async function resolveConversion(base, token, userId) {
+  if (cache.status) return conversionFromStatus(cache.status);
+  const status = await fetchStatus(base, token, userId);
+  cache.status = status;
+  return conversionFromStatus(status);
+}
+
+async function handleCreateUser(request, runtime) {
+  const base = envOf(runtime, "SUSCIYUAN_BASE", "https://susciyuan.com").replace(/\/+$/, "");
+  const token = envOf(runtime, "SUSCIYUAN_ACCESS_TOKEN", "");
+  const adminUserId = envOf(runtime, "SUSCIYUAN_USER_ID", "1") || "1";
+  if (!token) {
+    return json(500, { ok: false, error: "missing SUSCIYUAN_ACCESS_TOKEN" });
+  }
+
+  const conv = await resolveConversion(base, token, adminUserId);
+  const quotaValue = quotaUnitsForCny(CREATE_CREDIT_CNY, conv.quotaPerUnit, conv.usdRate);
+  const mmdd = shanghaiMMDD(new Date());
+  const names = await listDailyUsernames(base, token, adminUserId, mmdd);
+  let serial = nextDailyUsername(names, mmdd);
+  const password = generatePassword();
+
+  let createdName = "";
+  let createdId = null;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    let payload;
+    try {
+      payload = await apiPost(base, token, adminUserId, "/api/user/", {
+        username: serial,
+        password: password,
+        display_name: serial,
+        role: 1,
+        group: "default",
+      });
+    } catch (err) {
+      const msg = (err && err.message) || "create failed";
+      if (isDuplicateUsernameError(msg)) {
+        names.push(serial);
+        serial = nextDailyUsername(names, mmdd);
+        continue;
+      }
+      return json(502, { ok: false, error: "创建用户失败：" + String(msg) });
+    }
+    if (payload && payload.success) {
+      createdName = serial;
+      createdId = pickCreatedUserId(payload);
+      break;
+    }
+    const msg = (payload && payload.message) || "create failed";
+    if (isDuplicateUsernameError(msg)) {
+      names.push(serial);
+      serial = nextDailyUsername(names, mmdd);
+      continue;
+    }
+    return json(502, { ok: false, error: "创建用户失败：" + String(msg) });
+  }
+  if (!createdName) {
+    return json(502, { ok: false, error: "创建用户失败：用户名冲突次数过多" });
+  }
+
+  if (createdId == null) {
+    const found = await findUserByUsername(base, token, adminUserId, createdName);
+    if (found && found.id != null) createdId = Number(found.id);
+  }
+  if (createdId == null || !Number.isFinite(createdId)) {
+    return json(502, {
+      ok: false,
+      created: true,
+      username: createdName,
+      password: password,
+      error: "用户 " + createdName + " 已创建，但未能查询到用户 ID，额度未加上。",
+    });
+  }
+
+  try {
+    const managed = await apiPost(base, token, adminUserId, "/api/user/manage", {
+      id: createdId,
+      action: "add_quota",
+      mode: "add",
+      value: quotaValue,
+    });
+    if (!managed || !managed.success) {
+      const msg = (managed && managed.message) || "manage failed";
+      return json(502, {
+        ok: false,
+        created: true,
+        username: createdName,
+        password: password,
+        error: "用户 " + createdName + " 已创建，但额度未加上：" + String(msg),
+      });
+    }
+  } catch (err) {
+    const msg = (err && err.message) || "manage failed";
+    return json(502, {
+      ok: false,
+      created: true,
+      username: createdName,
+      password: password,
+      error: "用户 " + createdName + " 已创建，但额度未加上：" + String(msg),
+    });
+  }
+
+  cache = { ts: 0, status: cache.status, logs: null };
+  return json(200, {
+    ok: true,
+    username: createdName,
+    password: password,
+    quota: quotaValue,
+    credit_cny: CREATE_CREDIT_CNY,
+  });
 }
 
 async function fetchLogsWindow(base, token, userId, startTs, endTs) {
@@ -718,6 +1076,10 @@ function buildOverview(status, rawLogs, cached) {
       top_error_count: topErr[1],
     },
     type_counts: typeCounts,
+    tag_counts: {
+      [TAG_FACE]: logs.filter((l) => (l.tags || []).includes(TAG_FACE)).length,
+      [TAG_ASSET]: logs.filter((l) => (l.tags || []).includes(TAG_ASSET)).length,
+    },
     top_models: modelCounts.map(([model, count]) => ({ model, count })),
     logs,
     log_total_in_window: filtered.length,
@@ -764,6 +1126,10 @@ function emptyVolces(error) {
 function resetBalancesState() {
   balancesCache = { ts: 0, payload: null };
   walletHistory = [];
+}
+
+function resetOverviewCache() {
+  cache = { ts: 0, status: null, logs: null };
 }
 
 function assertAipddHost(url) {
@@ -1205,6 +1571,7 @@ export {
   volcXDate,
   normQuery,
   resetBalancesState,
+  resetOverviewCache,
   makeSessionToken,
   verifySessionToken,
   renderLoginPage,
@@ -1215,6 +1582,18 @@ export {
   mergeWalletHistory,
   appendWalletSnapshot,
   WALLET_COOKIE,
+  extraTagsForLog,
+  isRealPersonText,
+  isAssetLibraryText,
+  shanghaiMMDD,
+  quotaUnitsForCny,
+  nextDailyUsername,
+  generatePassword,
+  isDuplicateUsernameError,
+  extractUsers,
+  TAG_FACE,
+  TAG_ASSET,
+  CREATE_CREDIT_CNY,
 };
 
 export default {
@@ -1267,6 +1646,10 @@ export default {
 
       if (request.method === "GET" && (path === "/" || path === "/index.html" || path === "/app.html")) {
         return htmlPage(200, renderAppPage());
+      }
+
+      if ((path === "/api/create-user" || path === "/api/create-user/") && request.method === "POST") {
+        return await handleCreateUser(request, runtime);
       }
 
       if (request.method !== "GET") {

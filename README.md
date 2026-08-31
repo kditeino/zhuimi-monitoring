@@ -12,6 +12,8 @@
 ## 功能
 
 - H5 看板：近 3 天用量、错误、用户/模型分布（默认全站 `site_wide`）
+- 日志类型 / 模型芯片可点击筛选；匹配火山真人拦截或参考素材的行带「真人脸」「素材库」标签
+- 「新增用户」：边缘函数代调 New API 创建当日 `User_MMDDnn` 并加 ¥100 额度，密钥不进页面源码
 - 错误日志轮询：`monitor.py` 按上次看到的 log id 增量拉取 type=5 错误
 - 摘要渲染：`render_report.py` 从本地看板 `/api/report` 生成 HTML 摘要
 
@@ -102,8 +104,9 @@ python3 render_report.py --period evening
 | `POST /login` / `GET /logout` | Worker 兜底，页面不再使用（静态路径 POST 会被 OSS 吃掉） |
 | `GET /app.html` | H5 看板 |
 | `GET /api/session` | 会话是否有效（未登录 JSON 401，不带 Basic 弹窗） |
-| `GET /api/overview` | 指标 + 近 3 天日志（`?refresh=1` 跳过缓存） |
+| `GET /api/overview` | 指标 + 近 3 天日志（`?refresh=1` 跳过缓存；日志带 `tags` / `tag_counts`） |
 | `GET /api/balances` | 官方 AIPDD AWCoin 剩余 + 火山引擎账单可用余额（`?refresh=1` 跳过约 45s 缓存；不增加 overview 出站请求） |
+| `POST /api/create-user` | 需登录会话。服务端创建 New API 用户并增加 ¥100 额度，返回一次性密码 |
 | `GET /api/report?hours=12` | 结构化摘要（仅 Python） |
 | `GET /api/report?period=morning / evening` | 半天窗口摘要（仅 Python） |
 | `GET /api/health` | 存活检查 |
@@ -113,7 +116,7 @@ python3 render_report.py --period evening
 - `esa.jsonc` — ESA Pages 构建与路由
 - `package.json` — ESA 构建脚本（无运行时依赖）
 - `scripts/build.mjs` — 将 `static/` 复制到 `dist/`，并生成 `dist-worker/index.js`
-- `src/index.js` — ESA 边缘函数（`/api/health`、`/api/overview`、`/api/balances`）
+- `src/index.js` — ESA 边缘函数（`/api/health`、`/api/overview`、`/api/balances`、`/api/create-user`）
 - `static/index.html` — H5 看板（构建后为 `dist/app.html`）
 - `static/login.html` — 网页登录表单（构建后为 `dist/index.html`）
 - `static/404.html` — ESA `404Page` 回退页

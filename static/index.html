@@ -266,15 +266,50 @@
       margin: 0 0 14px;
     }
     .chip {
+      appearance: none;
+      font-family: inherit;
       font-size: 11px;
       border: 1px solid var(--line);
       background: var(--bg-elev);
       border-radius: 999px;
       padding: 3px 8px;
       color: var(--text-2);
+      cursor: pointer;
+      user-select: none;
+    }
+    .chip:hover { border-color: var(--steel); color: var(--text); }
+    .chip:focus-visible {
+      outline: 2px solid var(--steel);
+      outline-offset: 2px;
+    }
+    .chip.selected {
+      background: var(--bg-active);
+      border-color: var(--row-active-bd);
+      color: var(--text);
     }
     .chip b { font-weight: 650; color: var(--text); }
     .chip.bad b { color: var(--error); }
+    .chip.tag-face { border-color: var(--badge-error-bd); }
+    .chip.tag-asset { border-color: var(--pill-bd); }
+    .row-top .badges { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .badge.extra { cursor: pointer; }
+    .badge.tag-face { background: var(--error-dim); color: var(--badge-error-fg); border-color: var(--badge-error-bd); }
+    .badge.tag-asset { background: var(--steel-dim); color: var(--steel); border-color: var(--pill-bd); }
+    .create-user-box {
+      background: var(--bg-card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      margin-bottom: 12px;
+    }
+    .create-user-head {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      margin-bottom: 8px;
+      font-size: 13px;
+    }
+    .create-user-head .ok { color: var(--ok); font-weight: 620; }
+    .create-user-head .warn { color: var(--error); font-weight: 620; }
+    .create-user-actions { display: inline-flex; gap: 6px; margin-left: auto; }
     .section-title {
       display: flex; justify-content: space-between; align-items: baseline;
       margin: 4px 2px 8px;
@@ -313,6 +348,7 @@
       border-radius: 999px; padding: 2px 8px;
       border: 1px solid transparent;
     }
+    .badge[data-kind] { cursor: pointer; }
     .t-充值 { background: var(--steel-dim); color: var(--badge-recharge-fg); border-color: var(--badge-recharge-bd); }
     .t-消费 { background: var(--ok-dim); color: var(--badge-consume-fg); border-color: var(--badge-consume-bd); }
     .t-管理 { background: var(--badge-manage-bg); color: var(--badge-manage-fg); border-color: var(--badge-manage-bd); }
@@ -425,11 +461,22 @@
         <span id="windowText">近 3 天</span>
         <span id="genText"></span>
         <button class="btn" id="refreshBtn" type="button">立即刷新</button>
+        <button class="btn" id="createUserBtn" type="button">新增用户</button>
         <a class="btn" id="logoutLink" href="/api/logout">退出</a>
       </div>
     </header>
 
     <div id="errorBox" class="banner err hidden"></div>
+    <div id="createUserBox" class="create-user-box hidden">
+      <div class="create-user-head">
+        <span id="createUserStatus" class="ok">已创建用户</span>
+        <div class="create-user-actions">
+          <button class="btn" id="copyCredsBtn" type="button">复制</button>
+          <button class="btn" id="closeCreateUser" type="button">关闭</button>
+        </div>
+      </div>
+      <pre class="full" id="createUserText"></pre>
+    </div>
     <div id="loading" class="loading">
       正在拉取近 3 天日志
       <div class="skel"><i></i><i></i><i></i><i></i></div>
@@ -769,29 +816,109 @@
       ).join("");
     }
 
-    function renderChips(typeCounts, models) {
-      const typeBox = document.getElementById("typeChips");
-      const modelBox = document.getElementById("modelChips");
-      const entries = Object.entries(typeCounts || {});
-      typeBox.innerHTML = entries.length
-        ? entries.map(([k, v]) => {
-            const bad = k === "错误" ? " bad" : "";
-            return '<span class="chip' + bad + '">' + esc(k) + ' <b>' + esc(v) + '</b></span>';
-          }).join("")
-        : "";
-      const top = (models || []).slice(0, 6);
-      modelBox.innerHTML = top.length
-        ? top.map(m => '<span class="chip">' + esc(m.model) + ' <b>' + esc(m.count) + '</b></span>').join("")
-        : "";
+    const TAG_FACE = "真人脸";
+    const TAG_ASSET = "素材库";
+
+    let allLogs = [];
+    let currentLogs = [];
+    let activeFilter = null;
+    let lastLogMeta = "";
+    let lastTypeCounts = {};
+    let lastModels = [];
+    let lastTagCounts = {};
+
+    function extraTagsOf(log) {
+      if (log && Array.isArray(log.tags)) return log.tags;
+      return [];
     }
 
-    let currentLogs = [];
+    function matchesFilter(log, filter) {
+      if (!filter) return true;
+      if (filter.kind === "type") return log.type_label === filter.value;
+      if (filter.kind === "model") return (log.model || "(无)") === filter.value;
+      if (filter.kind === "tag") return extraTagsOf(log).indexOf(filter.value) >= 0;
+      return true;
+    }
+
+    function chipSelected(kind, value) {
+      return !!(activeFilter && activeFilter.kind === kind && activeFilter.value === value);
+    }
+
+    function chipHtml(kind, value, count, extraClass) {
+      const selected = chipSelected(kind, value) ? " selected" : "";
+      const extra = extraClass ? " " + extraClass : "";
+      return (
+        '<button type="button" class="chip' + extra + selected + '" data-kind="' + esc(kind) +
+        '" data-value="' + esc(value) + '">' + esc(value) + " <b>" + esc(count) + "</b></button>"
+      );
+    }
+
+    function bindChipClicks(box) {
+      if (!box) return;
+      box.querySelectorAll(".chip").forEach(function (el) {
+        el.addEventListener("click", function () {
+          const kind = el.getAttribute("data-kind");
+          const value = el.getAttribute("data-value");
+          setFilter(kind, value);
+        });
+      });
+    }
+
+    function renderChips(typeCounts, models, tagCounts) {
+      lastTypeCounts = typeCounts || {};
+      lastModels = models || [];
+      lastTagCounts = tagCounts || {};
+      const typeBox = document.getElementById("typeChips");
+      const modelBox = document.getElementById("modelChips");
+      const entries = Object.entries(lastTypeCounts);
+      const tags = lastTagCounts;
+      const faceN = tags[TAG_FACE] != null ? tags[TAG_FACE] : 0;
+      const assetN = tags[TAG_ASSET] != null ? tags[TAG_ASSET] : 0;
+      const allSelected = !activeFilter ? " selected" : "";
+      let html = '<button type="button" class="chip' + allSelected + '" data-kind="all" data-value="全部">全部</button>';
+      html += entries.map(function (pair) {
+        const bad = pair[0] === "错误" ? "bad" : "";
+        return chipHtml("type", pair[0], pair[1], bad);
+      }).join("");
+      html += chipHtml("tag", TAG_FACE, faceN, "tag-face");
+      html += chipHtml("tag", TAG_ASSET, assetN, "tag-asset");
+      typeBox.innerHTML = html;
+      const top = lastModels.slice(0, 6);
+      modelBox.innerHTML = top.length
+        ? top.map(function (m) { return chipHtml("model", m.model, m.count, ""); }).join("")
+        : "";
+      bindChipClicks(typeBox);
+      bindChipClicks(modelBox);
+    }
+
+    function applyLogFilter() {
+      const logs = allLogs.filter(function (l) { return matchesFilter(l, activeFilter); });
+      const meta = document.getElementById("logMeta");
+      if (activeFilter) {
+        meta.textContent = "筛选 " + logs.length + "/" + allLogs.length + " · " + activeFilter.value;
+      } else {
+        meta.textContent = lastLogMeta;
+      }
+      renderLogs(logs);
+    }
+
+    function setFilter(kind, value) {
+      if (kind === "all" || !kind) {
+        activeFilter = null;
+      } else if (activeFilter && activeFilter.kind === kind && activeFilter.value === value) {
+        activeFilter = null;
+      } else {
+        activeFilter = { kind: kind, value: value };
+      }
+      renderChips(lastTypeCounts, lastModels, lastTagCounts);
+      applyLogFilter();
+    }
 
     function renderLogs(logs) {
       currentLogs = logs || [];
       const box = document.getElementById("logs");
       if (!currentLogs.length) {
-        box.innerHTML = '<div class="banner empty">窗口内暂无日志</div>';
+        box.innerHTML = '<div class="banner empty">' + (allLogs.length ? "当前筛选没有日志" : "窗口内暂无日志") + "</div>";
         return;
       }
       box.innerHTML = currentLogs.map((l, idx) => {
@@ -800,11 +927,18 @@
         const cost = showCost
           ? '<span class="muted">费用</span> <b class="yen">' + esc(money(l.cost_cny)) + '</b>'
           : '<span class="muted">费用</span> —';
+        const extras = extraTagsOf(l).map(function (t) {
+          const cls = t === TAG_FACE ? "tag-face" : "tag-asset";
+          return '<span class="badge extra ' + cls + '" data-kind="tag" data-value="' + esc(t) + '">' + esc(t) + "</span>";
+        }).join("");
         return (
           '<div class="row" data-idx="' + idx + '" role="button" tabindex="0">' +
             '<div class="row-top">' +
               '<span class="time">' + esc(l.time) + '</span>' +
-              '<span class="badge ' + badgeCls + '">' + esc(l.type_label) + '</span>' +
+              '<span class="badges">' +
+                '<span class="badge ' + badgeCls + '" data-kind="type" data-value="' + esc(l.type_label) + '">' + esc(l.type_label) + '</span>' +
+                extras +
+              '</span>' +
             '</div>' +
             '<div class="meta">' +
               '<span><span class="muted">用户</span> <b>' + esc(l.username || "—") + '</b></span>' +
@@ -821,6 +955,12 @@
         el.addEventListener("click", () => selectLog(Number(el.dataset.idx)));
         el.addEventListener("keydown", (e) => {
           if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectLog(Number(el.dataset.idx)); }
+        });
+      });
+      box.querySelectorAll(".badge[data-kind]").forEach(function (el) {
+        el.addEventListener("click", function (e) {
+          e.stopPropagation();
+          setFilter(el.getAttribute("data-kind"), el.getAttribute("data-value"));
         });
       });
     }
@@ -952,11 +1092,13 @@
           " (" + ((data.window && data.window.tz) || "CST") + ")";
         document.getElementById("genText").textContent =
           "更新 " + (data.generated_at || "") + (data.cached ? " · 缓存" : "");
-        document.getElementById("logMeta").textContent =
-          "展示 " + data.log_returned + "/" + data.log_total_in_window + "（上限 300）";
+        lastLogMeta = "展示 " + data.log_returned + "/" + data.log_total_in_window + "（上限 300）";
+        document.getElementById("logMeta").textContent = lastLogMeta;
         renderMetrics(data.metrics || {}, balances);
-        renderChips(data.type_counts || {}, data.top_models || []);
-        renderLogs(data.logs || []);
+        allLogs = data.logs || [];
+        activeFilter = null;
+        renderChips(data.type_counts || {}, data.top_models || [], data.tag_counts || {});
+        applyLogFilter();
         revealLatestLog();
       } catch (e) {
         loading.classList.add("hidden");
@@ -968,7 +1110,93 @@
       }
     }
 
+    function credentialBlock(username, password) {
+      return [
+        "------------------------------------------",
+        "模型平台地址：https://susciyuan.com",
+        "登录地址后可以自行创建多个KEY（API秘钥)",
+        "账号：" + username,
+        "密码：" + password,
+        "Seedance接口使用方法参见：https://aiworkin.feishu.cn/wiki/RZXkwDbzqi2auAkuF3EcJGWknVh",
+        "------------------------------------------"
+      ].join("\n");
+    }
+
+    function showCreateUserResult(data, isError) {
+      const box = document.getElementById("createUserBox");
+      const status = document.getElementById("createUserStatus");
+      const pre = document.getElementById("createUserText");
+      box.classList.remove("hidden");
+      if (data && data.username) {
+        status.className = isError ? "warn" : "ok";
+        status.textContent = isError ? (data.error || "用户已创建，但额度可能未加上") : "已创建用户 · ¥100";
+        pre.textContent = credentialBlock(data.username, data.password || "");
+      } else {
+        status.className = "warn";
+        status.textContent = (data && data.error) || "创建失败";
+        pre.textContent = "";
+      }
+    }
+
+    async function copyCreateUserText() {
+      const pre = document.getElementById("createUserText");
+      const text = pre ? pre.textContent : "";
+      if (!text) return;
+      const btn = document.getElementById("copyCredsBtn");
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+        }
+        if (btn) btn.textContent = "已复制";
+        setTimeout(function () { if (btn) btn.textContent = "复制"; }, 1600);
+      } catch (e) {
+        if (btn) btn.textContent = "复制失败";
+        setTimeout(function () { if (btn) btn.textContent = "复制"; }, 1600);
+      }
+    }
+
+    async function createUser() {
+      const btn = document.getElementById("createUserBtn");
+      if (!window.confirm("确认新增用户并充值 ¥100？")) return;
+      btn.disabled = true;
+      btn.textContent = "创建中";
+      try {
+        const res = await fetch("/api/create-user", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        if (res.status === 401) { location.replace("/"); return; }
+        const data = await res.json();
+        if (data && data.username) {
+          showCreateUserResult(data, !data.ok);
+        } else {
+          showCreateUserResult({ error: (data && data.error) || "创建失败" }, true);
+        }
+      } catch (e) {
+        showCreateUserResult({ error: "创建失败：" + (e.message || e) }, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "新增用户";
+      }
+    }
+
     document.getElementById("refreshBtn").addEventListener("click", () => load(true));
+    document.getElementById("createUserBtn").addEventListener("click", createUser);
+    document.getElementById("copyCredsBtn").addEventListener("click", copyCreateUserText);
+    document.getElementById("closeCreateUser").addEventListener("click", function () {
+      document.getElementById("createUserBox").classList.add("hidden");
+      const pre = document.getElementById("createUserText");
+      if (pre) pre.textContent = "";
+    });
     document.getElementById("logoutLink").addEventListener("click", (e) => {
       e.preventDefault();
       fetch("/api/logout", { method: "POST", credentials: "same-origin" })
